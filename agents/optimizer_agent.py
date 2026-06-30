@@ -2,6 +2,7 @@
 optimizer_agent.py  ─  OptimizerAgent 노드 (registry 버전)
 """
 
+import time
 import numpy as np
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.optimize import minimize
@@ -10,13 +11,6 @@ from pymoo.core.problem import Problem
 
 import registry
 from state import MealPlanState
-import time
-
-t0 = time.monotonic()
-result = minimize(problem, algorithm,
-                   termination=get_termination("n_gen", n_gen),
-                   seed=42, verbose=True)
-print(f"[OptimizerAgent] minimize() 소요: {time.monotonic()-t0:.1f}s")
 
 DAILY_SLOTS = [
     ("아침_밥","밥"),  ("아침_국","국"),    ("아침_주찬","주찬"),
@@ -262,9 +256,12 @@ def optimizer_agent(state: MealPlanState) -> dict:
 
     problem   = MealPlanProblem(state["pool"], constraint, state["budget_per_meal"])
     algorithm = NSGA2(pop_size=pop_size, eliminate_duplicates=True)
+
+    t0 = time.monotonic()
     result    = minimize(problem, algorithm,
                          termination=get_termination("n_gen", n_gen),
                          seed=42, verbose=True)
+    print(f"[OptimizerAgent] minimize() 소요: {time.monotonic()-t0:.1f}s")
 
     f1_min = result.F[:, 0].min()
     print(f"[OptimizerAgent] 완료 — Pareto {len(result.X)}개 | f1={f1_min:.4f}")
