@@ -7,6 +7,8 @@ services:
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.10
       - key: NEO4J_URI
         sync: false
       - key: NEO4J_USERNAME
@@ -22,4 +24,6 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: FRONTEND_ORIGIN
+        sync: false
+      - key: JWT_SECRET
         sync: false
