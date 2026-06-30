@@ -10,6 +10,13 @@ from pymoo.core.problem import Problem
 
 import registry
 from state import MealPlanState
+import time
+
+t0 = time.monotonic()
+result = minimize(problem, algorithm,
+                   termination=get_termination("n_gen", n_gen),
+                   seed=42, verbose=True)
+print(f"[OptimizerAgent] minimize() 소요: {time.monotonic()-t0:.1f}s")
 
 DAILY_SLOTS = [
     ("아침_밥","밥"),  ("아침_국","국"),    ("아침_주찬","주찬"),
@@ -248,8 +255,8 @@ def optimizer_agent(state: MealPlanState) -> dict:
     constraint = registry.get(state["constraint_key"])
 
     count    = state.get("violation_count", 0)
-    pop_size = 80 + count * 20
-    n_gen    = 60 + count * 15
+    pop_size = min(80 + count * 20, 150)
+    n_gen    = min(60 + count * 15, 90)
 
     print(f"\n[OptimizerAgent] 최적화 시작 (시도 #{count+1} | pop={pop_size} | gen={n_gen})")
 
