@@ -193,6 +193,24 @@ def run_pipeline_for_run(
         registry.put(f"facility_for_run_{run_id}", facility_id)
 
         # 자동 도출된 질환을 meal_plan_runs에 기록 (프론트 표시용)
+        #
+        # [수정] agents/candidate_agent.py는 INTERSECTION_EXCLUDED_DISEASES
+        # (신장질환 등)를 내부에서 빼고 교집합을 계산하지만, 그 결과(어떤
+        # 질환이 빠졌는지)를 print 로그에만 남기고 state나 반환값에는 남기지
+        # 않음. 그래서 diseases_targeted=initial_state["diseases"](합집합
+        # 전체, 신장질환 포함)만 저장되고 diseases_excluded는 항상 빈 채로
+        # 남아있었음("교집합 제외 질환: 없음"으로 보였던 원인).
+        # candidate_agent.py를 수정하지 않고, 여기서 같은 상수를 가져와
+        # 동일한 분리 로직을 한 번 더 적용해 정확한 값을 채움.
+        from candidate_agent import INTERSECTION_EXCLUDED_DISEASES
+        all_diseases = initial_state["diseases"]
+        diseases_targeted = [d for d in all_diseases if d not in INTERSECTION_EXCLUDED_DISEASES]
+        diseases_excluded = [d for d in all_diseases if d in INTERSECTION_EXCLUDED_DISEASES]
+        if not diseases_targeted:
+            # candidate_agent.py와 동일한 폴백: 전부 제외 대상이면 첫 번째를 단독 사용
+            diseases_targeted = diseases_excluded[:1]
+            diseases_excluded = diseases_excluded[1:]
+
         # 치매는 diseases_targeted(메뉴 풀 필터링 대상)에는 포함되지 않지만
         # (get_all_diseases가 의도적으로 제외), PersonalizeAgent가 끼니 단위
         # boost_nutrients 보강으로 별도 처리하므로 그 인원수를 따로 기록해
@@ -201,7 +219,8 @@ def run_pipeline_for_run(
             1 for p in patients if "치매" in p._resolve_diseases()
         )
         sb.table("meal_plan_runs").update({
-            "diseases_targeted": initial_state["diseases"],
+            "diseases_targeted": diseases_targeted,
+            "diseases_excluded": diseases_excluded,
             "dementia_patient_count": dementia_count,
         }).eq("id", run_id).execute()
 
