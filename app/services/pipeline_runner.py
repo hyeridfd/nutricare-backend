@@ -193,8 +193,16 @@ def run_pipeline_for_run(
         registry.put(f"facility_for_run_{run_id}", facility_id)
 
         # 자동 도출된 질환을 meal_plan_runs에 기록 (프론트 표시용)
+        # 치매는 diseases_targeted(메뉴 풀 필터링 대상)에는 포함되지 않지만
+        # (get_all_diseases가 의도적으로 제외), PersonalizeAgent가 끼니 단위
+        # boost_nutrients 보강으로 별도 처리하므로 그 인원수를 따로 기록해
+        # 프론트에서 "치매가 무시되지 않았음"을 명확히 보여줄 수 있게 함.
+        dementia_count = sum(
+            1 for p in patients if "치매" in p._resolve_diseases()
+        )
         sb.table("meal_plan_runs").update({
             "diseases_targeted": initial_state["diseases"],
+            "dementia_patient_count": dementia_count,
         }).eq("id", run_id).execute()
 
         config = {"configurable": {"thread_id": run_id}}
