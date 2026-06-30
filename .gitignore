@@ -1,9 +1,18 @@
+# 환경변수 (절대 커밋 금지 — Neo4j/Supabase/OpenAI 키 포함)
 .env
 .env.local
+
+# Python
 venv/
 __pycache__/
 *.pyc
 *.pyo
+
+# 로컬 산출물 (preference_weights.json 등은 추후 Supabase로 이전 예정)
 *.xlsx
 preference_weights.json
 pool_preference_scores.json
+
+# OS
+.DS_Store
+Thumbs.db
