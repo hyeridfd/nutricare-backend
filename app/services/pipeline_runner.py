@@ -61,16 +61,29 @@ def _load_patients_for_facility(facility_id: str, budget_per_meal: float):
     return patients
 
 
-def _build_initial_state(run_id: str, facility_id: str, diseases: list[str],
-                          budget_per_meal: float):
+def _build_initial_state(run_id: str, facility_id: str, budget_per_meal: float):
     """graph.py __main__ 블록의 initial_state 구성을 그대로 따르되,
-    waste_log는 하드코딩된 샘플 대신 Supabase에서 조회(없으면 None)."""
+    waste_log는 하드코딩된 샘플 대신 Supabase에서 조회(없으면 None).
+
+    [변경] diseases를 프론트엔드에서 사용자가 직접 선택하게 했었는데,
+    원래 agents/facility_optimization.py의 설계 의도는 "시설에 등록된
+    전체 환자의 질환을 자동으로 모아서" 최적화하는 것이었음
+    (get_all_diseases가 그 역할 — 연하장애/치매는 텍스처 처리 대상이라
+    제외). 이제 외부에서 diseases를 받지 않고, 여기서 환자 목록 기준으로
+    자동 도출해 원래 에이전트 동작과 동일하게 맞춤."""
     import facility_optimization as fac
     from preference_update_agent import load_weights
 
     patients = _load_patients_for_facility(facility_id, budget_per_meal)
     if not patients:
         raise ValueError("활성 환자가 없습니다. 먼저 환자를 등록하세요.")
+
+    diseases = fac.get_all_diseases(patients)
+    if not diseases:
+        raise ValueError(
+            "등록된 환자들에게서 최적화 대상 질환(고혈압/당뇨병/신장질환)을 "
+            "찾지 못했습니다. 환자 등록 시 질환 정보를 확인하세요."
+        )
 
     fc = fac.derive_facility_constraint(patients)
     constraint_adapter = fac.FacilityConstraintAdapter(fc)
@@ -153,7 +166,6 @@ def _load_recent_waste_log(facility_id: str, patients: list) -> list | None:
 def run_pipeline_for_run(
     run_id: str,
     facility_id: str,
-    diseases: list[str],
     budget_per_meal: float,
     auto_approve: bool,
 ):
@@ -162,6 +174,10 @@ def run_pipeline_for_run(
     graph.py의 app.stream()을 그대로 사용해 candidate→...→hitl(interrupt)까지
     실행하고, interrupt에서 멈추면 meal_plan_runs.status='pending_review'로
     기록. auto_approve=True면 곧바로 resume까지 이어서 실행.
+
+    [변경] diseases는 더 이상 외부(프론트엔드 선택)에서 받지 않고,
+    _build_initial_state 내부에서 시설 등록 환자 전체를 기준으로 자동 도출함
+    (agents/facility_optimization.get_all_diseases와 동일한 원본 설계).
     """
     sb = get_supabase()
     _set_active_facility(facility_id)
@@ -170,11 +186,16 @@ def run_pipeline_for_run(
         from graph import app as graph_app  # noqa: F401 (존재 확인용 import)
 
         initial_state, patients = _build_initial_state(
-            run_id, facility_id, diseases, budget_per_meal
+            run_id, facility_id, budget_per_meal
         )
         # 환자 리스트와 facility_id를 나중에(approve 시점에) 다시 찾을 수 있도록 registry에 보관
         registry.put(f"patients_for_run_{run_id}", patients)
         registry.put(f"facility_for_run_{run_id}", facility_id)
+
+        # 자동 도출된 질환을 meal_plan_runs에 기록 (프론트 표시용)
+        sb.table("meal_plan_runs").update({
+            "diseases_targeted": initial_state["diseases"],
+        }).eq("id", run_id).execute()
 
         config = {"configurable": {"thread_id": run_id}}
 

@@ -24,7 +24,6 @@ router = APIRouter()
 
 class RunRequest(BaseModel):
     facility_id: str
-    diseases: list[str]              # 예: ["고혈압", "당뇨병", "신장질환"]
     budget_per_meal: float = 10000
     auto_approve: bool = True        # 1차 구현: HITL 자동 승인
 
@@ -40,13 +39,18 @@ def start_run(payload: RunRequest, background_tasks: BackgroundTasks):
     파이프라인 실행을 시작하고 즉시 run_id를 반환.
     실제 NSGA-II 최적화는 background_tasks로 비동기 실행되며,
     프론트는 GET /{run_id}로 폴링해 진행 상태를 확인.
+
+    [변경] diseases는 더 이상 요청에서 받지 않음 — 시설에 등록된 전체
+    활성 환자를 기준으로 pipeline_runner가 자동 도출함(원본 agents 설계와
+    동일). diseases_targeted는 일단 빈 배열로 시작하고, 파이프라인이
+    질환을 도출한 직후 실제 값으로 채워짐.
     """
     sb = get_supabase()
 
     run_row = {
         "facility_id":       payload.facility_id,
         "status":            "optimizing",
-        "diseases_targeted": payload.diseases,
+        "diseases_targeted": [],
     }
     result = sb.table("meal_plan_runs").insert(run_row).execute()
     run_id = result.data[0]["id"]
@@ -55,7 +59,6 @@ def start_run(payload: RunRequest, background_tasks: BackgroundTasks):
         run_pipeline_for_run,
         run_id=run_id,
         facility_id=payload.facility_id,
-        diseases=payload.diseases,
         budget_per_meal=payload.budget_per_meal,
         auto_approve=payload.auto_approve,
     )
