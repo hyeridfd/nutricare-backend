@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.services.preference_persistence_patch import apply_patch
 apply_patch()
 
-from app.routers import patients, meal_plans, dashboard, waste, orders, auth
+from app.routers import patients, meal_plans, dashboard, waste, orders, auth, preferences
 from app.services.db_clients import init_clients, close_clients
 
 
@@ -63,6 +63,7 @@ app.include_router(meal_plans.router, prefix="/api/meal-plans", tags=["meal-plan
 app.include_router(dashboard.router,  prefix="/api/dashboard",  tags=["dashboard"])
 app.include_router(waste.router,      prefix="/api/waste-logs", tags=["waste"])
 app.include_router(orders.router,     prefix="/api/orders",     tags=["orders"])
+app.include_router(preferences.router, prefix="/api/preferences", tags=["preferences"])
 
 
 @app.get("/")
