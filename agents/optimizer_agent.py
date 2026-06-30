@@ -248,8 +248,8 @@ def optimizer_agent(state: MealPlanState) -> dict:
     constraint = registry.get(state["constraint_key"])
 
     count    = state.get("violation_count", 0)
-    pop_size = 500 + count * 100
-    n_gen    = 300 + count * 50
+    pop_size = 80 + count * 20
+    n_gen    = 60 + count * 15
 
     print(f"\n[OptimizerAgent] 최적화 시작 (시도 #{count+1} | pop={pop_size} | gen={n_gen})")
 

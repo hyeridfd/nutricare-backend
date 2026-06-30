@@ -28,6 +28,7 @@ if str(AGENTS_DIR) not in sys.path:
 
 from app.services.db_clients import get_supabase
 from app.services.patient_logic import build_patient_profile, Sex, KidneyType
+from app.services.preference_persistence_patch import set_active_facility as _set_active_facility
 
 import registry  # agents/registry.py
 
@@ -163,6 +164,7 @@ def run_pipeline_for_run(
     기록. auto_approve=True면 곧바로 resume까지 이어서 실행.
     """
     sb = get_supabase()
+    _set_active_facility(facility_id)
 
     try:
         from graph import app as graph_app  # noqa: F401 (존재 확인용 import)
@@ -170,8 +172,9 @@ def run_pipeline_for_run(
         initial_state, patients = _build_initial_state(
             run_id, facility_id, diseases, budget_per_meal
         )
-        # 환자 리스트를 나중에(approve 시점에) 다시 찾을 수 있도록 registry에 보관
+        # 환자 리스트와 facility_id를 나중에(approve 시점에) 다시 찾을 수 있도록 registry에 보관
         registry.put(f"patients_for_run_{run_id}", patients)
+        registry.put(f"facility_for_run_{run_id}", facility_id)
 
         config = {"configurable": {"thread_id": run_id}}
 
@@ -193,7 +196,7 @@ def run_pipeline_for_run(
 
         # interrupt 없이 끝까지 갔다면(이론상 hitl 노드를 항상 거치므로
         # 거의 발생하지 않지만 방어적으로 처리) 그대로 완료 처리
-        _finalize_run(run_id, last_state, patients)
+        _finalize_run(run_id, last_state, patients, facility_id)
 
     except Exception as e:
         sb.table("meal_plan_runs").update({"status": "rejected"}).eq("id", run_id).execute()
@@ -215,6 +218,10 @@ def _resume(run_id: str, action: str, changes: dict | None = None):
 
     sb = get_supabase()
     config = {"configurable": {"thread_id": run_id}}
+
+    facility_key = f"facility_for_run_{run_id}"
+    if registry.has(facility_key):
+        _set_active_facility(registry.get(facility_key))
 
     resume_payload = {"action": action}
     if changes:
@@ -238,7 +245,21 @@ def _resume(run_id: str, action: str, changes: dict | None = None):
 
         patients_key = f"patients_for_run_{run_id}"
         patients = registry.get(patients_key) if registry.has(patients_key) else []
-        _finalize_run(run_id, last_state, patients)
+
+        facility_key = f"facility_for_run_{run_id}"
+        if registry.has(facility_key):
+            facility_id = registry.get(facility_key)
+        else:
+            # registry는 프로세스 메모리에만 있어 서버 재시작 시 비워질 수 있음 —
+            # 이 경우 Supabase에서 facility_id를 다시 조회(환자 1명의 facility_id로 역추적)
+            facility_id = None
+            if patients:
+                p_row = sb.table("patients").select("facility_id") \
+                          .eq("id", getattr(patients[0], "_supabase_id", "")).execute().data
+                if p_row:
+                    facility_id = p_row[0]["facility_id"]
+
+        _finalize_run(run_id, last_state, patients, facility_id)
 
     except Exception as e:
         sb.table("meal_plan_runs").update({"status": "rejected"}).eq("id", run_id).execute()
@@ -269,11 +290,17 @@ def _drain_stream(stream_iter):
     return False, accumulated
 
 
-def _finalize_run(run_id: str, state: dict, patients: list):
+def _finalize_run(run_id: str, state: dict, patients: list, facility_id: str | None):
     """
     파이프라인이 끝까지(report → ... → END) 실행된 뒤 호출.
     이 시점 state에는 personalize_reasons, serving_map, report_paths 등이
     모두 채워져 있어야 정상(orchestrator_agent의 분기를 다 거쳤다는 전제).
+
+    [참고] preference_weights/pool(preference_score)은 여기서 따로 저장하지
+    않음 — preference_persistence_patch.py가 agents/preference_update_agent.py의
+    save_weights/save_pool_scores 자체를 Supabase 쓰기로 교체해 두었으므로,
+    그래프 실행 중 PreferenceUpdateAgent/WeightAdaptAgent 노드가 이미
+    Supabase에 직접 저장을 마친 상태임.
     """
     sb = get_supabase()
 
@@ -286,14 +313,30 @@ def _finalize_run(run_id: str, state: dict, patients: list):
     if state.get("waste_log"):
         _save_waste_alerts(run_id, state, patients)
 
-    sb.table("meal_plan_runs").update({
+    update_row = {
         "status":        "approved",
         "reviewed_by":   "auto",
         "review_action": "approve",
         "reviewed_at":   "now()",
         "f1_violation":  _safe_float(state.get("violation_rate")),
         "reoptimize_count": state.get("violation_count", 0),
-    }).eq("id", run_id).execute()
+    }
+
+    # report_agent.py가 만든 로컬 파일(엑셀/조리지침서)을 Supabase Storage에
+    # 업로드하고 다운로드 URL을 같이 저장. Render는 재배포 시 로컬 파일이
+    # 사라지므로, 영구 보관은 Storage가 담당함.
+    report_paths = state.get("report_paths")
+    if report_paths:
+        from app.services.report_storage import upload_report_files
+        urls = upload_report_files(run_id, report_paths)
+        if "meal_plan" in urls:
+            update_row["report_meal_plan_url"] = urls["meal_plan"]
+        if "serving" in urls:
+            update_row["report_serving_url"] = urls["serving"]
+        if "cooking" in urls:
+            update_row["report_cooking_url"] = urls["cooking"]
+
+    sb.table("meal_plan_runs").update(update_row).eq("id", run_id).execute()
 
 
 def _safe_float(val):
