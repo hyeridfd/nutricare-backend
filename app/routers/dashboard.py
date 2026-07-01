@@ -1,18 +1,20 @@
 """
-routers/dashboard.py — 잔반/영양 알림 현황
+routers/dashboard.py — 어르신 현황 / 잔반 / 영양 알림 / 섭취량
 =======================================
-프론트엔드(src/lib/api.ts의 dashboardApi) 중 mealWaste, alerts 두 엔드포인트를
-구현. summary/residents/nutritionIntake는 아직 구현하지 않음(nutritionIntake는
-환자별 실제 섭취량을 저장하는 테이블이 아직 없어 별도 작업 필요 — 논의 후 진행).
+프론트엔드(src/lib/api.ts의 dashboardApi)의 summary, residents, mealWaste,
+alerts, nutritionIntake 다섯 엔드포인트를 모두 구현.
 
-[참고 — by_disease_type 라벨에 관해]
+[참고 — disease_type_label에 관해]
 patients 테이블은 "당뇨병","고혈압" 같은 원본 질환 배열(diseases)만 갖고
 있고, 리포트 엑셀에 쓰이는 "HM형" 같은 조합 라벨(disease_type_label)은
 PatientProfile 객체가 런타임에 계산하는 값이라 DB에 저장되어 있지 않음.
 여기서는 그 계산 로직을 다시 구현하지 않고, diseases 배열을 그대로
-콤마로 이어붙인 문자열("당뇨병,고혈압")을 그룹 키로 사용함. 정확한
-"HM형" 스타일 라벨이 필요하면 patients 테이블에 disease_type_label
-컬럼을 추가해 환자 등록/수정 시점에 계산해 저장하는 방식으로 바꿔야 함.
+콤마로 이어붙인 문자열("당뇨병,고혈압")을 대신 사용함(summary의
+disease_type_distribution만 예외 — 질환별 인원 분포는 조합이 아니라
+개별 질환 단위로 집계하는 게 더 직관적이라 diseases 배열의 각 항목을
+개별로 셈). 정확한 "HM형" 스타일 라벨이 필요하면 patients 테이블에
+disease_type_label 컬럼을 추가해 환자 등록/수정 시점에 계산해 저장하는
+방식으로 바꿔야 함.
 
 [참고 — 알림 status에 관해]
 nutrition_alerts.status는 현재 pipeline_runner.py가 항상 "sent"로만 저장함
@@ -47,6 +49,104 @@ SODIUM_UPPER_LIMIT = 2000.0
 def _avg_waste_rate(row: dict) -> float:
     values = [row.get(f, 0) or 0 for f in WASTE_RATE_FIELDS]
     return sum(values) / len(values) if values else 0.0
+
+
+@router.get("/summary")
+def get_summary(facility_id: str):
+    """
+    [추가 — 2026-07-01] '어르신 현황' 화면 상단 요약 카드가 호출하는
+    엔드포인트(이게 없어서 404가 났었음). 전체 인원 수 / 열린 영양
+    알림 건수 / 질환별 인원 분포를 반환.
+    """
+    sb = get_supabase()
+
+    patients = (
+        sb.table("patients")
+          .select("id,diseases")
+          .eq("facility_id", facility_id)
+          .eq("active", True)
+          .execute()
+          .data
+    )
+    total_patients = len(patients)
+    patient_ids = [p["id"] for p in patients]
+
+    nutrition_alert_count = 0
+    if patient_ids:
+        alerts = (
+            sb.table("nutrition_alerts")
+              .select("id", count="exact")
+              .in_("patient_id", patient_ids)
+              .eq("status", "sent")
+              .execute()
+        )
+        nutrition_alert_count = alerts.count or len(alerts.data or [])
+
+    # 질환별 인원 분포는 조합 라벨이 아니라 개별 질환 단위로 집계
+    # (한 환자가 여러 질환을 가지면 각 질환 카운트에 모두 반영됨)
+    disease_type_distribution: dict[str, int] = {}
+    for p in patients:
+        for d in (p.get("diseases") or []):
+            disease_type_distribution[d] = disease_type_distribution.get(d, 0) + 1
+
+    return {
+        "total_patients": total_patients,
+        "nutrition_alert_count": nutrition_alert_count,
+        "disease_type_distribution": disease_type_distribution,
+    }
+
+
+@router.get("/residents")
+def get_residents(facility_id: str):
+    """
+    [추가 — 2026-07-01] '어르신 현황' 화면의 어르신 목록 테이블이
+    호출하는 엔드포인트. 환자별 기본 정보 + 열린 영양 알림 영양소
+    목록을 함께 반환.
+    """
+    sb = get_supabase()
+
+    patients = (
+        sb.table("patients")
+          .select("id,name,age,diseases,meal_texture_rice,meal_texture_side")
+          .eq("facility_id", facility_id)
+          .eq("active", True)
+          .order("name")
+          .execute()
+          .data
+    )
+    if not patients:
+        return []
+
+    patient_ids = [p["id"] for p in patients]
+    alerts = (
+        sb.table("nutrition_alerts")
+          .select("patient_id,nutrient")
+          .in_("patient_id", patient_ids)
+          .eq("status", "sent")
+          .execute()
+          .data
+    )
+    alert_nutrients_by_patient: dict[str, list[str]] = {}
+    for a in alerts:
+        alert_nutrients_by_patient.setdefault(a["patient_id"], [])
+        if a["nutrient"] not in alert_nutrients_by_patient[a["patient_id"]]:
+            alert_nutrients_by_patient[a["patient_id"]].append(a["nutrient"])
+
+    result = []
+    for p in patients:
+        alert_nutrients = alert_nutrients_by_patient.get(p["id"], [])
+        result.append({
+            "id": p["id"],
+            "name": p["name"],
+            "age": p.get("age"),
+            # disease_type_label 컬럼이 따로 없어 원본 질환을 콤마로 이어붙임
+            # (모듈 docstring 참고 — "HM형" 같은 정확한 조합 라벨은 아님)
+            "disease_type_label": ",".join(p.get("diseases") or []) or "-",
+            "meal_texture": f"{p.get('meal_texture_rice', '-')}/{p.get('meal_texture_side', '-')}",
+            "alert_nutrients": alert_nutrients,
+            "status": "보강필요" if alert_nutrients else "정상",
+        })
+    return result
 
 
 @router.get("/meal-waste")
