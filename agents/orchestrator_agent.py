@@ -16,7 +16,7 @@ orchestrator_agent.py  ─  OrchestratorAgent 노드
 from state import MealPlanState
 
 VIOLATION_THRESH = 1.0
-MAX_REOPTIMIZE   = 3
+MAX_REOPTIMIZE   = 1   # 1번으로 변경
 
 
 def orchestrator_agent(state: MealPlanState) -> dict:
