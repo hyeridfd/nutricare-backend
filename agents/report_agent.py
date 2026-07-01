@@ -207,14 +207,44 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
     for i, h in enumerate(col_hdrs, 1):
         _hdr(ws1, f"{get_column_letter(i)}2", h, bg="2E5A9C", size=9)
 
+    # [추가 — 2026-07-01] 실제 배식 시 0.98 같은 소수점 ratio는 눈대중으로
+    # 맞추기 어려움. 현실적으로 담아줄 수 있는 0.25 단위 눈금으로 반올림함.
+    RATIO_STEPS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+    def _snap_ratio(ratio: float) -> float:
+        if not ratio:
+            return 1.0
+        return min(RATIO_STEPS, key=lambda s: abs(s - ratio))
+
     rows_detail = []
     for _, menu_row in df.iterrows():
         day  = menu_row["일차"]
         meal = menu_row["끼니"]
         for p in patients:
             key_str = f"{p.name}||{day}||{meal}"
-            srv     = serving_map.get(key_str, {})
-            ratio   = srv.get("ratio", 1.0)
+            srv       = serving_map.get(key_str, {})
+            raw_ratio = srv.get("ratio", 1.0) or 1.0
+
+            # [수정 — 2026-07-01] ratio만 반올림하고 배식량(g)·예상 영양소를
+            # 그대로 두면 표 안에서 숫자끼리 서로 안 맞게 됨(예: ratio=1.0인데
+            # 밥(g)은 0.98 기준 값). 반올림한 비율만큼 나머지 값도 같이
+            # 스케일링해 표 전체가 내적으로 일관되게 함.
+            snapped_ratio = _snap_ratio(raw_ratio)
+            scale = (snapped_ratio / raw_ratio) if raw_ratio else 1.0
+
+            def _scaled(val, _scale=scale):
+                return round((val or 0) * _scale, 1)
+
+            rice_g   = _scaled(srv.get("밥", srv.get("죽", 0)))
+            soup_ml  = _scaled(srv.get("국", 0))
+            main_g   = _scaled(srv.get("주찬", 0))
+            side1_g  = _scaled(srv.get("부찬1", 0))
+            side2_g  = _scaled(srv.get("부찬2", 0))
+            kimchi_g = _scaled(srv.get("김치", 0))
+            energy   = _scaled(srv.get("예상열량", 0))
+            protein  = _scaled(srv.get("예상단백질", 0))
+            sodium   = _scaled(srv.get("예상나트륨", 0))
+            carb     = _scaled(srv.get("예상탄수화물", 0))
 
             c     = getattr(p, "constraint", None) or constraint
             e_min = getattr(c, "energy_min", 0)    or 0
@@ -222,25 +252,18 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
             p_max = getattr(c, "protein_max", 9999) or 9999
             s_max = getattr(c, "sodium_max", 9999)  or 9999
 
-            ok_e = e_min <= (srv.get("예상열량", 0) or 0) <= e_max
-            ok_p = (srv.get("예상단백질", 0) or 0) <= p_max
-            ok_s = (srv.get("예상나트륨", 0) or 0) <= s_max
+            # 스케일링된(=표에 실제로 찍히는) 값 기준으로 OK 여부 재판정
+            ok_e = e_min <= energy <= e_max
+            ok_p = protein <= p_max
+            ok_s = sodium <= s_max
 
             rows_detail.append([
                 p.name,
                 getattr(p, "disease_type_label", "-"),
                 day, meal,
-                round(ratio, 2),
-                srv.get("밥",    srv.get("죽", 0)),
-                srv.get("국",    0),
-                srv.get("주찬",  0),
-                srv.get("부찬1", 0),
-                srv.get("부찬2", 0),
-                srv.get("김치",  0),
-                srv.get("예상열량",     0),
-                srv.get("예상단백질",   0),
-                srv.get("예상나트륨",   0),
-                srv.get("예상탄수화물", 0),
+                snapped_ratio,
+                rice_g, soup_ml, main_g, side1_g, side2_g, kimchi_g,
+                energy, protein, sodium, carb,
                 "✅" if ok_e else "⚠️",
                 "✅" if ok_p else "⚠️",
                 "✅" if ok_s else "⚠️",
