@@ -149,8 +149,16 @@ def _save_meal_plan_excel(df: pd.DataFrame, recommend_map: dict,
         df["권장재료포함메뉴"] = "-"
         df["권장재료포함수"]   = 0
 
-    for r_idx, row in enumerate(df.itertuples(), 3):
-        d = row._asdict()
+    for r_idx, (_, row) in enumerate(df.iterrows(), 3):
+        # [수정 — 2026-07-01] df.itertuples()는 "열량(kcal)" 같이 괄호가
+        # 포함된 컬럼명을 파이썬 식별자로 쓸 수 없어 _3/_4/_5... 같은
+        # 위치 기반 이름으로 자동 치환함(pandas 네임드튜플 제약). 그 결과
+        # d.get("열량(kcal)", "")가 항상 기본값("")을 반환하고, 그게 바로
+        # 아래 "빈 값이면 0 표시" 로직에 걸려 열량/나트륨/단백질/비용
+        # 4개 컬럼이 전부 0으로 찍히던 버그였음(Neo4j 데이터 문제가
+        # 아니었음). iterrows()는 Series를 반환해 컬럼명을 그대로 키로
+        # 쓸 수 있어 이 문제가 없음.
+        d = row.to_dict()
 
         for i, col in enumerate(cols, 1):
             source_col = display_source.get(col, col)
