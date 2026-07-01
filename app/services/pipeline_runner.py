@@ -24,9 +24,18 @@ nutrition_monitor_agent가 실제로 만드는 alert 딕셔너리 키("days",
 테이블에 해당 컬럼들이 항상 0으로 저장되던 버그를 수정. 또한
 "sent_at": "now()" 문자열 리터럴 버그(meal_plans.py의 approve_run과
 동일 패턴)도 함께 수정.
+
+[수정 — 2026-07-01 #2] personalized_swaps 같은 테이블은 한 run에 8천 건이
+넘게 나올 수 있는데, 이걸 한 번의 insert() 호출로 통째로 보내다가
+httpcore.RemoteProtocolError: Server disconnected로 실패하는 문제가
+있었음(_save_personalized_swaps). 대용량 단일 요청이 원인으로 보여,
+_batched_upsert 헬퍼를 추가해 모든 대량 저장(_save_meal_plan_slots,
+_save_personalized_swaps, _save_servings, _save_nutrition_intake)을
+일정 크기로 나눠 보내고, 일시적 네트워크 오류 시 자동 재시도하도록 변경.
 """
 
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -413,6 +422,66 @@ def _safe_float(val):
         return None
 
 
+BATCH_SIZE = 500
+MAX_RETRIES = 3
+RETRY_BACKOFF_SEC = 2.0
+
+
+def _is_transient_network_error(e: Exception) -> bool:
+    """일시적 네트워크 오류(연결 끊김 등)로 재시도해볼 만한지 판단.
+    httpcore/httpx 예외를 여기서 직접 import해서 isinstance로 비교하지
+    않고 예외 이름/메시지로 판단함 — postgrest-py가 내부적으로 쓰는
+    HTTP 클라이언트 구현이 버전에 따라 바뀔 수 있어, 문자열 매칭이 더
+    안전하고 의존성도 덜 생김."""
+    text = f"{type(e).__name__}: {e}".lower()
+    return any(kw in text for kw in [
+        "disconnected", "remoteprotocolerror", "connectionreset",
+        "timeout", "connectionerror", "broken pipe",
+    ])
+
+
+def _batched_write(sb, table_name: str, rows: list[dict],
+                    mode: str = "insert", on_conflict: str | None = None,
+                    batch_size: int = BATCH_SIZE):
+    """
+    [추가 — 2026-07-01] 대량의 행을 한 번의 요청으로 보내다가
+    httpcore.RemoteProtocolError: Server disconnected로 실패하는 문제
+    (personalized_swaps처럼 한 run에 수천~수만 건이 나올 수 있는 테이블)를
+    막기 위해, batch_size개씩 나눠서 여러 번 보내고 각 배치는 일시적
+    네트워크 오류 시 최대 MAX_RETRIES회 재시도함.
+    """
+    if not rows:
+        return
+
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        last_exc = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                query = sb.table(table_name)
+                if mode == "upsert":
+                    query = query.upsert(batch, on_conflict=on_conflict)
+                else:
+                    query = query.insert(batch)
+                query.execute()
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                if attempt < MAX_RETRIES and _is_transient_network_error(e):
+                    wait = RETRY_BACKOFF_SEC * attempt
+                    print(f"  [{table_name}] 배치 {i // batch_size + 1} 저장 실패"
+                          f"(일시적 오류로 추정) — {wait:.0f}초 후 재시도 "
+                          f"({attempt}/{MAX_RETRIES}): {e}")
+                    time.sleep(wait)
+                    continue
+                break
+
+        if last_exc:
+            raise last_exc
+
+
 # ════════════════════════════════════════════════════════════
 # Supabase 저장 헬퍼
 # ════════════════════════════════════════════════════════════
@@ -439,9 +508,8 @@ def _save_meal_plan_slots(run_id: str, state: dict):
             "recommended_menu_count":   r.get("권장재료포함수", 0),
         })
     if rows:
-        sb.table("meal_plan_slots").upsert(
-            rows, on_conflict="run_id,day_number,meal_type"
-        ).execute()
+        _batched_write(sb, "meal_plan_slots", rows, mode="upsert",
+                       on_conflict="run_id,day_number,meal_type")
 
 
 def _patient_id_lookup(patients: list) -> dict:
@@ -473,7 +541,7 @@ def _save_personalized_swaps(run_id: str, state: dict, patients: list):
                 "serving_ratio": change.get("ratio"),
             })
     if rows:
-        sb.table("personalized_swaps").insert(rows).execute()
+        _batched_write(sb, "personalized_swaps", rows, mode="insert")
 
 
 def _save_servings(run_id: str, state: dict, patients: list):
@@ -508,9 +576,8 @@ def _save_servings(run_id: str, state: dict, patients: list):
             "sodium_ok":  srv.get("나트륨OK") == "✅",
         })
     if rows:
-        sb.table("servings").upsert(
-            rows, on_conflict="run_id,patient_id,day_number,meal_type"
-        ).execute()
+        _batched_write(sb, "servings", rows, mode="upsert",
+                       on_conflict="run_id,patient_id,day_number,meal_type")
 
 
 def _save_nutrition_intake(state: dict, patients: list):
@@ -559,9 +626,8 @@ def _save_nutrition_intake(state: dict, patients: list):
             })
 
     if rows:
-        sb.table("nutrition_intake_logs").upsert(
-            rows, on_conflict="waste_log_id"
-        ).execute()
+        _batched_write(sb, "nutrition_intake_logs", rows, mode="upsert",
+                       on_conflict="waste_log_id")
         print(f"  [nutrition_intake_logs 저장] {len(rows)}건")
 
 
