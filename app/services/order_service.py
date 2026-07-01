@@ -35,13 +35,24 @@ Food-[:HAS_INGREDIENT {nutri_weight}]->Recipe-[:MAPPED_TO]->Product 로
     (PORTION_SCALE 적용된)"을 먹는다고 가정한 근사 발주량임. 실제 필요량과
     다소 차이가 날 수 있으므로, 발주 담당자가 여유분을 고려해 참고용으로
     사용해야 함.
+[수정 — 2026-07-01 #4] 매 요청마다 Neo4jGraph(...)를 새로 생성해 Aura와
+TLS 핸드셰이크를 반복하던 문제를 수정. 발주 페이지는 주차를 바꿔가며
+반복 조회하는 경우가 많아, 커넥션 재사용의 효과가 특히 큼. 모듈 전역에
+드라이버 하나를 캐싱해 프로세스 내에서 재사용함(Render가 단일 워커
+프로세스로 뜬다는 전제와 동일하게, 이 캐시도 프로세스 단위로 안전함).
 """
 
 import os
 import re
+import time
 from app.services.db_clients import get_supabase
 
 PORTION_SCALE = 0.8  # agents/candidate_agent.py의 PORTION_SCALE과 반드시 동일하게 유지
+
+_CACHE_TTL_SEC = 3600  # 1시간 — 식재료/가격 데이터는 하루 안에 자주 바뀌지 않으므로
+_order_cache: dict[tuple, tuple[float, dict]] = {}
+
+_graph_client = None  # Neo4jGraph 싱글턴(프로세스당 1회만 연결)
 
 INGREDIENT_QUERY = """
     MATCH (f:Food) WHERE f.title IN $menu_names
@@ -79,13 +90,16 @@ def _parse_unit_to_grams(unit_str: str | None) -> float | None:
 
 
 def _get_neo4j_graph():
-    from langchain_neo4j import Neo4jGraph
-    return Neo4jGraph(
-        url=os.getenv("NEO4J_URI"),
-        username=os.getenv("NEO4J_USERNAME"),
-        password=os.getenv("NEO4J_PASSWORD"),
-        database=os.getenv("NEO4J_DATABASE", "neo4j"),
-    )
+    global _graph_client
+    if _graph_client is None:
+        from langchain_neo4j import Neo4jGraph
+        _graph_client = Neo4jGraph(
+            url=os.getenv("NEO4J_URI"),
+            username=os.getenv("NEO4J_USERNAME"),
+            password=os.getenv("NEO4J_PASSWORD"),
+            database=os.getenv("NEO4J_DATABASE", "neo4j"),
+        )
+    return _graph_client
 
 
 def _week_day_range(week_offset: int) -> tuple[int, int]:
@@ -99,7 +113,20 @@ def build_order_data(run_id: str, week_offset: int = 0) -> dict:
     """
     발주 미리보기(JSON)와 엑셀 생성 양쪽에서 공유하는 핵심 계산.
     반환 스키마는 src/pages/OrderExcel.tsx의 OrderPreview 타입과 정확히 일치.
+    같은 (run_id, week_offset)에 대해 5분 이내 재호출되면 캐시를 반환함
+    (미리보기 직후 다운로드하는 흔한 흐름에서 Neo4j 재조회를 피하기 위함).
     """
+    cache_key = (run_id, week_offset)
+    cached = _order_cache.get(cache_key)
+    if cached and (time.time() - cached[0]) < _CACHE_TTL_SEC:
+        return cached[1]
+
+    result = _compute_order_data(run_id, week_offset)
+    _order_cache[cache_key] = (time.time(), result)
+    return result
+
+
+def _compute_order_data(run_id: str, week_offset: int) -> dict:
     sb = get_supabase()
 
     run = sb.table("meal_plan_runs").select("facility_id").eq("id", run_id).single().execute()

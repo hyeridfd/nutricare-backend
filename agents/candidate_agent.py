@@ -46,6 +46,7 @@ Neo4j Graph-RAG 기반으로 질환별 후보 메뉴 풀을 생성합니다.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from langchain_neo4j import Neo4jGraph
 from state import MealPlanState
 from preference_update_agent import load_pool_scores
@@ -221,9 +222,20 @@ def candidate_agent(state: MealPlanState) -> dict:
         print(f"  [안내] 교집합 가능한 질환이 없어 '{intersection_diseases[0]}' 단독 풀을 사용합니다.")
 
     # ── ① 질환별로 따로 쿼리 (제외 대상도 로그용으로 단독 조회) ─
+    # [수정 — 2026-07-01] 질환별 쿼리는 서로 완전히 독립적인데(각자 다른
+    # Disease 노드 기준으로 조회) 기존에는 for문으로 하나씩 순차 실행해
+    # 질환이 2개 이상이면 그만큼 대기 시간이 배로 늘어났음. Neo4j 드라이버는
+    # 멀티스레드 동시 호출을 지원하므로 ThreadPoolExecutor로 병렬 실행.
     per_disease_pools = {}
+    with ThreadPoolExecutor(max_workers=min(len(diseases), 4)) as executor:
+        future_to_disease = {
+            executor.submit(_query_single_disease, graph, disease): disease
+            for disease in diseases
+        }
+        for future, disease in future_to_disease.items():
+            per_disease_pools[disease] = future.result()
+
     for disease in diseases:
-        per_disease_pools[disease] = _query_single_disease(graph, disease)
         sizes = {cat: len(m) for cat, m in per_disease_pools[disease].items()}
         tag = " (교집합 제외 — PersonalizeAgent에서 정량 보정)" if disease in excluded_diseases else ""
         print(f"  [{disease}] 단독 후보: {sizes}{tag}")
