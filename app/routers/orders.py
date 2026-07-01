@@ -1,89 +1,143 @@
 """
-routers/orders.py — 발주 엑셀 생성 페이지용 API
-====================================================
-승인된 식단표(meal_plan_slots)를 기준으로 필요한 식자재 수량을 집계합니다.
-실제 단가는 Neo4j의 Product 노드(price_today)에서 가져옵니다.
+routers/orders.py — 발주(구매) 미리보기 + 엑셀 다운로드
+================================================================================
+GET /preview — JSON 형태로 발주 항목 미리보기 (프론트 api.ts의 ordersApi.preview)
+GET /export  — 거래명세서 스타일 엑셀 파일을 바로 스트리밍 다운로드
+
+계산 로직 자체는 app/services/order_service.py에 있고, 이 라우터는
+JSON으로 내보낼지 엑셀로 내보낼지만 다르게 처리함(같은 데이터, 다른 표현).
+
+엑셀은 보고서 파일들(report_agent.py)과 달리 Supabase Storage에 올리지
+않고 요청 시점에 즉시 생성해 바로 스트리밍함 — 저장해 둘 필요 없이 언제든
+같은 run_id로 다시 요청하면 동일한 계산을 재현할 수 있는 파생 데이터이기
+때문.
 """
 
-from fastapi import APIRouter, HTTPException
-from collections import defaultdict
+import io
+from datetime import datetime, timezone
+from urllib.parse import quote
 
-from app.services.db_clients import get_supabase, get_neo4j
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+
+from app.services.order_service import build_order_data
 
 router = APIRouter()
 
 
 @router.get("/preview")
-def get_order_preview(run_id: str, week_offset: int = 0):
-    """
-    PAGE 5 발주 미리보기 표.
-    week_offset=0이면 1~7일차, 1이면 8~14일차 식으로 28일을 4주로 나눠 집계.
-    """
-    sb = get_supabase()
+def preview_order(run_id: str, week_offset: int = 0):
+    try:
+        return build_order_data(run_id, week_offset)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"발주 계산 중 오류: {e}")
 
-    day_start = week_offset * 7 + 1
-    day_end   = day_start + 6
 
-    slots = sb.table("meal_plan_slots").select("*") \
-              .eq("run_id", run_id) \
-              .gte("day_number", day_start).lte("day_number", day_end) \
-              .execute().data
+@router.get("/export")
+def export_order_excel(run_id: str, week_offset: int = 0):
+    try:
+        data = build_order_data(run_id, week_offset)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"발주 계산 중 오류: {e}")
 
-    if not slots:
-        raise HTTPException(404, "해당 주차의 식단 데이터가 없습니다.")
+    buf = _build_order_excel(data, run_id, week_offset)
 
-    # 메뉴별 등장 횟수 집계 (밥/국/주찬/부찬1/부찬2/김치)
-    menu_count = defaultdict(int)
-    for s in slots:
-        for col in ["rice", "soup", "main_dish", "side_dish_1", "side_dish_2", "kimchi"]:
-            menu_count[s[col]] += 1
+    filename = f"발주서_{data['day_range'][0]}일-{data['day_range'][1]}일.xlsx"
+    encoded_filename = quote(filename)
+    content_disposition = (
+        f"attachment; filename=\"order.xlsx\"; filename*=UTF-8''{encoded_filename}"
+    )
 
-    # Neo4j에서 메뉴별 재료/단가 조회 (HAS_INGREDIENT → MAPPED_TO Product)
-    graph = get_neo4j()
-    menu_names = list(menu_count.keys())
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": content_disposition},
+    )
 
-    query = """
-        UNWIND $menu_names AS mname
-        MATCH (f:Food {title: mname})-[hi:HAS_INGREDIENT]->(r:Recipe)
-        OPTIONAL MATCH (r)-[:MAPPED_TO]->(p:Product)
-        WITH mname, r, hi, p
-        ORDER BY p.price_today ASC
-        WITH mname, r, hi, head(collect(p)) AS cheapest_p
-        RETURN mname,
-               r.title AS ingredient,
-               hi.nutri_weight AS weight_per_serving,
-               cheapest_p.title AS product_name,
-               cheapest_p.price_today AS unit_price,
-               cheapest_p.unit_g AS unit_g
-    """
-    ingredient_rows = graph.query(query, params={"menu_names": menu_names})
 
-    order_items = []
-    for row in ingredient_rows:
-        servings = menu_count.get(row["mname"], 0)
-        weight_per_serving = row.get("weight_per_serving") or 0
-        total_weight_g = weight_per_serving * servings
+def _build_order_excel(data: dict, run_id: str, week_offset: int) -> io.BytesIO:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
 
-        unit_price = row.get("unit_price")
-        unit_g     = row.get("unit_g") or 1
-        total_cost = round((unit_price / unit_g) * total_weight_g, 0) if unit_price else None
+    def hdr(ws, addr, val, bg="1F497D", fg="FFFFFF", size=10, bold=True):
+        c = ws[addr]
+        c.value = val
+        c.font = Font(name="맑은 고딕", bold=bold, color=fg, size=size)
+        c.fill = PatternFill("solid", fgColor=bg)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-        order_items.append({
-            "menu_name":      row["mname"],
-            "ingredient":     row["ingredient"],
-            "servings_used":  servings,
-            "total_weight_g": round(total_weight_g, 1),
-            "product_name":   row.get("product_name"),
-            "unit_price":     unit_price,
-            "estimated_cost": total_cost,
-        })
+    def cell(ws, addr, val, align="center", bold=False, size=9):
+        c = ws[addr]
+        c.value = val
+        c.font = Font(name="맑은 고딕", bold=bold, size=size)
+        c.alignment = Alignment(horizontal=align, vertical="center")
 
-    total_cost_sum = sum(i["estimated_cost"] for i in order_items if i["estimated_cost"])
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "거래명세서"
+    ws.sheet_view.showGridLines = False
 
-    return {
-        "run_id": run_id,
-        "week_range": f"{day_start}~{day_end}일차",
-        "total_items": len(order_items),
-        "total_cost": total_cost_sum,
-        "items": order_items,
-    }
+    widths = [6, 20, 16, 22, 10, 14, 14, 10]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    start_day, end_day = data["day_range"]
+
+    ws.merge_cells("A1:H1")
+    hdr(ws, "A1", "거 래 명 세 서", bg="1F497D", size=16)
+    ws.row_dimensions[1].height = 32
+
+    ws.merge_cells("A3:D3")
+    cell(ws, "A3", f"공급받는자: {data['facility_name'] or '-'}", align="left", bold=True, size=11)
+    ws.merge_cells("E3:H3")
+    cell(ws, "E3", f"발행일: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}", align="left", size=10)
+
+    ws.merge_cells("A4:D4")
+    cell(ws, "A4", f"대상 기간: {start_day}일차 ~ {end_day}일차 (7일)", align="left", size=10)
+    ws.merge_cells("E4:H4")
+    cell(ws, "E4", f"대상 인원: {data['patient_count']}명", align="left", size=10)
+
+    table_hdrs = ["번호", "품목명", "상품(참고)", "규격", "수량(kg)", "단가(원/kg)", "공급가액(원)", "비고"]
+    header_row = 6
+    for i, h in enumerate(table_hdrs, 1):
+        hdr(ws, f"{get_column_letter(i)}{header_row}", h, bg="2E5A9C", size=9)
+    ws.row_dimensions[header_row].height = 20
+
+    thin = Side(style="thin")
+    row_idx = header_row + 1
+    for i, item in enumerate(data["items"], 1):
+        values = [
+            i,
+            item["ingredient_name"],
+            item["product_name"],
+            item["spec"],
+            item["quantity_kg"],
+            item["unit_price_won_per_kg"],
+            item["amount_won"],
+            "",
+        ]
+        for col, val in enumerate(values, 1):
+            align = "left" if col in (2, 3, 4) else "center"
+            cell(ws, f"{get_column_letter(col)}{row_idx}", val, align=align)
+        row_idx += 1
+
+    # 합계 행
+    ws.merge_cells(f"A{row_idx}:F{row_idx}")
+    hdr(ws, f"A{row_idx}", "합계", bg="D9E1F2", fg="1F497D", size=10)
+    cell(ws, f"G{row_idx}", data["total_amount_won"], bold=True, size=10)
+    ws[f"G{row_idx}"].fill = PatternFill("solid", fgColor="D9E1F2")
+
+    last_row = row_idx
+    for r in ws.iter_rows(min_row=header_row, max_row=last_row, min_col=1, max_col=8):
+        for c in r:
+            c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf

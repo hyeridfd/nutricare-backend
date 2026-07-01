@@ -1,256 +1,268 @@
 """
-routers/dashboard.py — 어르신 현황 / 식사·잔반 현황 페이지용 API
-=====================================================================
-nutricare_dashboard.html의 PAGE 1(어르신 현황), PAGE 2(식사·잔반 현황)에
-필요한 집계 데이터를 제공합니다.
+routers/dashboard.py — 잔반/영양 알림 현황
+=======================================
+프론트엔드(src/lib/api.ts의 dashboardApi) 중 mealWaste, alerts 두 엔드포인트를
+구현. summary/residents/nutritionIntake는 아직 구현하지 않음(nutritionIntake는
+환자별 실제 섭취량을 저장하는 테이블이 아직 없어 별도 작업 필요 — 논의 후 진행).
+
+[참고 — by_disease_type 라벨에 관해]
+patients 테이블은 "당뇨병","고혈압" 같은 원본 질환 배열(diseases)만 갖고
+있고, 리포트 엑셀에 쓰이는 "HM형" 같은 조합 라벨(disease_type_label)은
+PatientProfile 객체가 런타임에 계산하는 값이라 DB에 저장되어 있지 않음.
+여기서는 그 계산 로직을 다시 구현하지 않고, diseases 배열을 그대로
+콤마로 이어붙인 문자열("당뇨병,고혈압")을 그룹 키로 사용함. 정확한
+"HM형" 스타일 라벨이 필요하면 patients 테이블에 disease_type_label
+컬럼을 추가해 환자 등록/수정 시점에 계산해 저장하는 방식으로 바꿔야 함.
+
+[참고 — 알림 status에 관해]
+nutrition_alerts.status는 현재 pipeline_runner.py가 항상 "sent"로만 저장함
+(읽음/해결 처리 워크플로우가 아직 없음). 프론트가 기본값으로 보내는
+status=open은 편의상 "sent"와 동일하게 취급함.
 """
 
-from fastapi import APIRouter
-from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
+from fastapi import APIRouter
 from app.services.db_clients import get_supabase
 
 router = APIRouter()
 
+WASTE_RATE_FIELDS = [
+    "rice_waste_rate", "soup_waste_rate", "main_dish_waste_rate",
+    "side_dish_1_waste_rate", "side_dish_2_waste_rate", "kimchi_waste_rate",
+]
 
-@router.get("/summary")
-def get_summary(facility_id: str):
-    """PAGE 1 상단 KPI 카드: 총 입소 인원, 식사 모니터링 필요, 영양 보강 알림, 평균 식사율."""
-    sb = get_supabase()
-
-    patients = sb.table("patients").select("id, name, disease_type_label") \
-                 .eq("facility_id", facility_id).eq("active", True).execute().data
-    total = len(patients)
-
-    open_alerts = sb.table("nutrition_alerts").select("patient_id") \
-                     .eq("status", "open").execute().data
-    alert_patient_ids = {a["patient_id"] for a in open_alerts}
-
-    # 질환유형 분포 (disease_type_label 기준)
-    type_dist = defaultdict(int)
-    for p in patients:
-        type_dist[p.get("disease_type_label") or "일반형"] += 1
-
-    return {
-        "total_patients": total,
-        "nutrition_alert_count": len(alert_patient_ids),
-        "disease_type_distribution": dict(type_dist),
-    }
+# [추가 — 2026-07-01] agents/waste_monitoring_agent.py의 DAILY_TARGETS와
+# 동일한 값을 씀(환자 개별 constraint가 아니라 시설 공통 fallback 기준).
+# 정확한 개인별 목표치가 필요하면 나중에 환자별 constraint를 조인하는
+# 방식으로 확장 가능.
+DAILY_TARGETS = {"energy": 1500.0, "protein": 60.0, "carb": 300.0}
+DEFICIT_RATIO = 0.8
+# 나트륨은 "이 이하로" 기준(상한)이라 energy/protein/carb와 의미가 반대임.
+# pct_of_target이 100%를 넘으면 좋다는 뜻이 아니라 과다 섭취라는 뜻이므로
+# 프론트에서 표시할 때 주의 필요.
+SODIUM_UPPER_LIMIT = 2000.0
 
 
-@router.get("/residents")
-def list_residents(facility_id: str):
-    """PAGE 1 하단 테이블: 어르신 목록 + 최근 식사율/영양상태."""
-    sb = get_supabase()
-
-    patients = sb.table("patients").select("*") \
-                 .eq("facility_id", facility_id).eq("active", True).execute().data
-
-    open_alerts = sb.table("nutrition_alerts").select("patient_id, nutrient") \
-                     .eq("status", "open").execute().data
-    alerts_by_patient = defaultdict(list)
-    for a in open_alerts:
-        alerts_by_patient[a["patient_id"]].append(a["nutrient"])
-
-    rows = []
-    for p in patients:
-        rows.append({
-            "id": p["id"],
-            "name": p["name"],
-            "age": p["age"],
-            "disease_type_label": p.get("disease_type_label") or "일반형",
-            "meal_texture": f"{p['meal_texture_rice']}/{p['meal_texture_side']}",
-            "alert_nutrients": alerts_by_patient.get(p["id"], []),
-            "status": "보강필요" if p["id"] in alerts_by_patient else "정상",
-        })
-    return rows
+def _avg_waste_rate(row: dict) -> float:
+    values = [row.get(f, 0) or 0 for f in WASTE_RATE_FIELDS]
+    return sum(values) / len(values) if values else 0.0
 
 
 @router.get("/meal-waste")
-def get_meal_waste_summary(facility_id: str, days: int = 7):
-    """PAGE 2: 식이유형별/끼니별 잔반율 집계."""
+def get_meal_waste(facility_id: str, days: int = 7):
+    """
+    최근 N일 잔반 현황을 끼니별 / 질환조합별 평균 잔반율(%)로 집계.
+    """
     sb = get_supabase()
 
-    patients = sb.table("patients").select("id, disease_type_label") \
-                 .eq("facility_id", facility_id).eq("active", True).execute().data
-    patient_type = {p["id"]: p.get("disease_type_label") or "일반형" for p in patients}
-    patient_ids = list(patient_type.keys())
-
-    if not patient_ids:
+    patients = (
+        sb.table("patients")
+          .select("id,diseases")
+          .eq("facility_id", facility_id)
+          .eq("active", True)
+          .execute()
+          .data
+    )
+    if not patients:
         return {"by_disease_type": {}, "by_meal": {}}
 
-    logs = sb.table("waste_logs").select("*") \
-             .in_("patient_id", patient_ids) \
-             .order("recorded_at", desc=True).limit(1000).execute().data
-
-    waste_fields = [
-        "rice_waste_rate", "soup_waste_rate", "main_dish_waste_rate",
-        "side_dish_1_waste_rate", "side_dish_2_waste_rate", "kimchi_waste_rate",
-    ]
-
-    by_type, by_type_count = defaultdict(float), defaultdict(int)
-    by_meal, by_meal_count = defaultdict(float), defaultdict(int)
-
-    for log in logs:
-        vals = [log[f] for f in waste_fields if log.get(f) is not None]
-        if not vals:
-            continue
-        avg_waste = sum(vals) / len(vals)
-
-        dtype = patient_type.get(log["patient_id"], "일반형")
-        by_type[dtype] += avg_waste
-        by_type_count[dtype] += 1
-
-        by_meal[log["meal_type"]] += avg_waste
-        by_meal_count[log["meal_type"]] += 1
-
-    return {
-        "by_disease_type": {
-            k: round(v / by_type_count[k] * 100, 1) for k, v in by_type.items()
-        },
-        "by_meal": {
-            k: round(v / by_meal_count[k] * 100, 1) for k, v in by_meal.items()
-        },
+    patient_ids = [p["id"] for p in patients]
+    disease_label_by_id = {
+        p["id"]: ",".join(p.get("diseases") or []) or "미분류"
+        for p in patients
     }
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    logs = (
+        sb.table("waste_logs")
+          .select("patient_id,meal_type,recorded_at," + ",".join(WASTE_RATE_FIELDS))
+          .in_("patient_id", patient_ids)
+          .gte("recorded_at", since)
+          .execute()
+          .data
+    )
+
+    by_meal_rates: dict[str, list[float]] = {}
+    by_disease_rates: dict[str, list[float]] = {}
+
+    for row in logs:
+        rate = _avg_waste_rate(row)
+        meal = row.get("meal_type") or "기타"
+        by_meal_rates.setdefault(meal, []).append(rate)
+
+        disease_label = disease_label_by_id.get(row["patient_id"], "미분류")
+        by_disease_rates.setdefault(disease_label, []).append(rate)
+
+    by_meal = {
+        k: round(sum(v) / len(v) * 100, 1) for k, v in by_meal_rates.items()
+    }
+    by_disease_type = {
+        k: round(sum(v) / len(v) * 100, 1) for k, v in by_disease_rates.items()
+    }
+
+    return {"by_disease_type": by_disease_type, "by_meal": by_meal}
 
 
 @router.get("/nutrition-alerts")
-def list_nutrition_alerts(facility_id: str, status: str = "open"):
-    """영양 보강 알림 목록 (PAGE 1 알림 카드)."""
+def get_nutrition_alerts(facility_id: str, status: str = "open"):
+    """
+    영양 부족 알림 + (있으면) GPT가 생성한 처방 텍스트를 함께 반환.
+    """
     sb = get_supabase()
 
-    patients = sb.table("patients").select("id, name") \
-                 .eq("facility_id", facility_id).execute().data
-    patient_name = {p["id"]: p["name"] for p in patients}
+    patients = (
+        sb.table("patients")
+          .select("id,name")
+          .eq("facility_id", facility_id)
+          .execute()
+          .data
+    )
+    if not patients:
+        return []
 
-    alerts = sb.table("nutrition_alerts").select("*") \
-               .eq("status", status).order("detected_at", desc=True).execute().data
+    id_to_name = {p["id"]: p["name"] for p in patients}
+    patient_ids = list(id_to_name.keys())
 
+    query = sb.table("nutrition_alerts").select("*").in_("patient_id", patient_ids)
+    # nutrition_alerts.status는 현재 "sent"로만 저장됨(위 모듈 docstring 참고).
+    # 프론트 기본값 "open"을 "sent"와 동일하게 취급.
+    if status and status not in ("all", "open"):
+        query = query.eq("status", status)
+    elif status == "open":
+        query = query.eq("status", "sent")
+
+    alerts = query.order("sent_at", desc=True).execute().data
+    if not alerts:
+        return []
+
+    alert_ids = [a["id"] for a in alerts]
+    interventions = (
+        sb.table("interventions")
+          .select("alert_id,prescription_text")
+          .in_("alert_id", alert_ids)
+          .execute()
+          .data
+    )
+    prescription_by_alert = {i["alert_id"]: i["prescription_text"] for i in interventions}
+
+    result = []
     for a in alerts:
-        a["patient_name"] = patient_name.get(a["patient_id"], "알 수 없음")
-    return alerts
+        result.append({
+            "id": a["id"],
+            "patient_id": a["patient_id"],
+            "patient_name": id_to_name.get(a["patient_id"], "-"),
+            "nutrient": a.get("nutrient"),
+            "consecutive_days": a.get("consecutive_days"),
+            "avg_intake": a.get("avg_intake"),
+            "standard_value": a.get("standard_value"),
+            "deficit_rate": a.get("deficit_rate"),
+            "status": a.get("status"),
+            "sent_at": a.get("sent_at"),
+            "prescription": prescription_by_alert.get(a["id"]),
+        })
+    return result
 
 
-# ── KDRIs 일일 기준값 (agents/waste_monitoring_agent.py의 DAILY_TARGETS와 동일) ──
-KDRI_DAILY_TARGETS = {
-    "energy":  1500.0,   # kcal/일
-    "protein":   60.0,   # g/일
-    "carb":     300.0,   # g/일
-    "sodium":  2000.0,   # mg/일 (상한 — 적게 먹는 게 더 안전하므로 별도 처리)
-}
-DEFICIT_RATIO = 0.8  # 권장량 80% 미만이면 "부족"
+def _summary(values: list[float], target: float) -> dict:
+    if not values:
+        return {"facility_avg": 0.0, "target": target, "pct_of_target": 0.0}
+    avg = sum(values) / len(values)
+    return {
+        "facility_avg": round(avg, 1),
+        "target": target,
+        "pct_of_target": round(avg / target * 100, 1) if target else 0.0,
+    }
 
 
 @router.get("/nutrition-intake")
 def get_nutrition_intake(facility_id: str, days: int = 7):
     """
-    PAGE 3(영양소 섭취 현황): waste_logs(잔반율) × servings(배식량 기준 예상
-    영양소)를 곱해 "실제 섭취 영양소"를 계산하고, KDRIs 일일 기준 대비
-    주간 평균 섭취율(%)을 반환.
-
-    계산식 (agents/waste_monitoring_agent.py의 plate_waste_input_agent와 동일 원리):
-        실제 섭취량 = servings.expected_* × (1 - 잔반율)
-        (servings.expected_*는 이미 "배식량 기준 영양값"이므로 100g당 영양값을
-         다시 곱할 필요 없이, 섭취율만 곱하면 됨)
+    [추가 — 2026-07-01] nutrition_intake_logs(끼니별 실제 섭취량)를
+    환자별 일일 합계 → 평균으로 재집계. pipeline_runner.py의
+    _save_nutrition_intake가 이 테이블을 채움(그 전 실행분은 데이터가
+    없을 수 있음 — 이 기능 배포 이후 실행된 것부터 채워짐).
     """
     sb = get_supabase()
 
-    patients = sb.table("patients").select("id, name") \
-                 .eq("facility_id", facility_id).eq("active", True).execute().data
+    patients = (
+        sb.table("patients")
+          .select("id,name")
+          .eq("facility_id", facility_id)
+          .eq("active", True)
+          .execute()
+          .data
+    )
     if not patients:
         return {"by_nutrient": {}, "by_patient": []}
-    patient_ids = [p["id"] for p in patients]
-    name_by_id = {p["id"]: p["name"] for p in patients}
 
-    waste_logs = sb.table("waste_logs").select("*") \
-                   .in_("patient_id", patient_ids) \
-                   .order("recorded_at", desc=True).limit(500).execute().data
-    if not waste_logs:
+    patient_ids = [p["id"] for p in patients]
+    id_to_name = {p["id"]: p["name"] for p in patients}
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    logs = (
+        sb.table("nutrition_intake_logs")
+          .select("patient_id,day_number,energy_kcal,protein_g,sodium_mg,carb_g,computed_at")
+          .in_("patient_id", patient_ids)
+          .gte("computed_at", since)
+          .execute()
+          .data
+    )
+    if not logs:
         return {"by_nutrient": {}, "by_patient": []}
 
-    run_ids = {log["run_id"] for log in waste_logs if log.get("run_id")}
-    servings_lookup = {}
-    if run_ids:
-        servings = sb.table("servings").select("*") \
-                     .in_("run_id", list(run_ids)).execute().data
-        for s in servings:
-            key = (s["run_id"], s["patient_id"], s["day_number"], s["meal_type"])
-            servings_lookup[key] = s
-
-    WASTE_FIELD_MAP = {
-        "밥": "rice_waste_rate", "국": "soup_waste_rate", "주찬": "main_dish_waste_rate",
-        "부찬1": "side_dish_1_waste_rate", "부찬2": "side_dish_2_waste_rate",
-        "김치": "kimchi_waste_rate",
-    }
-
-    # 환자별 끼니별 실제 섭취 영양소 합산 → 환자별 일일 평균
-    patient_daily: dict = {}  # {patient_id: {day_number: {energy, protein, carb, sodium}}}
-
-    for log in waste_logs:
-        srv = servings_lookup.get(
-            (log.get("run_id"), log["patient_id"], log["day_number"], log["meal_type"])
+    # 끼니 단위 로그를 (환자, 일차) 기준 일일 합계로 재집계
+    daily_totals: dict[tuple, dict] = {}
+    for row in logs:
+        key = (row["patient_id"], row["day_number"])
+        d = daily_totals.setdefault(
+            key, {"energy": 0.0, "protein": 0.0, "sodium": 0.0, "carb": 0.0}
         )
-        if not srv:
-            continue
+        d["energy"]  += row.get("energy_kcal") or 0
+        d["protein"] += row.get("protein_g") or 0
+        d["sodium"]  += row.get("sodium_mg") or 0
+        d["carb"]    += row.get("carb_g") or 0
 
-        # 6개 슬롯 잔반율 평균으로 그 끼니 전체의 섭취율 근사
-        # (슬롯별 정확한 영양소 분해는 agents 쪽 pool 데이터가 필요해 더 복잡하므로,
-        #  대시보드 집계 목적에서는 끼니 평균 섭취율로 단순화)
-        waste_rates = [log.get(f, 0.0) or 0.0 for f in WASTE_FIELD_MAP.values()]
-        avg_intake_rate = 1.0 - (sum(waste_rates) / len(waste_rates))
+    by_patient_days: dict[str, list[dict]] = {}
+    for (pid, _day), totals in daily_totals.items():
+        by_patient_days.setdefault(pid, []).append(totals)
 
-        pid = log["patient_id"]
-        day = log["day_number"]
-        patient_daily.setdefault(pid, {}).setdefault(
-            day, {"energy": 0.0, "protein": 0.0, "carb": 0.0, "sodium": 0.0}
-        )
-        bucket = patient_daily[pid][day]
-        bucket["energy"]  += (srv.get("expected_energy_kcal")   or 0) * avg_intake_rate
-        bucket["protein"] += (srv.get("expected_protein_g")     or 0) * avg_intake_rate
-        bucket["carb"]    += (srv.get("expected_carb_g")        or 0) * avg_intake_rate
-        bucket["sodium"]  += (srv.get("expected_sodium_mg")     or 0) * avg_intake_rate
-
-    # 환자별 일일 평균 → 시설 전체 평균(%) 집계
-    nutrient_sums = {"energy": 0.0, "protein": 0.0, "carb": 0.0, "sodium": 0.0}
-    nutrient_counts = {"energy": 0, "protein": 0, "carb": 0, "sodium": 0}
     by_patient = []
+    all_energy, all_protein, all_carb, all_sodium = [], [], [], []
 
-    for pid, daily in patient_daily.items():
-        day_count = len(daily)
-        if day_count == 0:
-            continue
-        avg = {
-            nut: sum(d[nut] for d in daily.values()) / day_count
-            for nut in ["energy", "protein", "carb", "sodium"]
-        }
-        for nut in nutrient_sums:
-            nutrient_sums[nut] += avg[nut]
-            nutrient_counts[nut] += 1
+    for pid, day_list in by_patient_days.items():
+        n = len(day_list)
+        avg_energy  = sum(d["energy"]  for d in day_list) / n
+        avg_protein = sum(d["protein"] for d in day_list) / n
+        avg_carb    = sum(d["carb"]    for d in day_list) / n
+        avg_sodium  = sum(d["sodium"]  for d in day_list) / n
+
+        energy_pct = (
+            round(avg_energy / DAILY_TARGETS["energy"] * 100, 1)
+            if DAILY_TARGETS["energy"] else 0.0
+        )
+        is_deficit = avg_energy < DAILY_TARGETS["energy"] * DEFICIT_RATIO
 
         by_patient.append({
             "patient_id": pid,
-            "patient_name": name_by_id.get(pid, "알 수 없음"),
-            "avg_energy_kcal": round(avg["energy"], 1),
-            "avg_protein_g": round(avg["protein"], 1),
-            "avg_carb_g": round(avg["carb"], 1),
-            "avg_sodium_mg": round(avg["sodium"], 1),
-            "energy_pct_of_target": round(avg["energy"] / KDRI_DAILY_TARGETS["energy"] * 100, 1),
-            "is_deficit": avg["energy"] < KDRI_DAILY_TARGETS["energy"] * DEFICIT_RATIO,
+            "patient_name": id_to_name.get(pid, "-"),
+            "avg_energy_kcal": round(avg_energy, 1),
+            "avg_protein_g":   round(avg_protein, 1),
+            "avg_carb_g":      round(avg_carb, 1),
+            "avg_sodium_mg":   round(avg_sodium, 1),
+            "energy_pct_of_target": energy_pct,
+            "is_deficit": is_deficit,
         })
+        all_energy.append(avg_energy)
+        all_protein.append(avg_protein)
+        all_carb.append(avg_carb)
+        all_sodium.append(avg_sodium)
 
-    by_nutrient = {}
-    for nut, target in KDRI_DAILY_TARGETS.items():
-        count = nutrient_counts.get(nut, 0)
-        if count == 0:
-            continue
-        facility_avg = nutrient_sums[nut] / count
-        by_nutrient[nut] = {
-            "facility_avg": round(facility_avg, 1),
-            "target": target,
-            "pct_of_target": round(facility_avg / target * 100, 1),
-        }
-
-    return {
-        "by_nutrient": by_nutrient,
-        "by_patient": sorted(by_patient, key=lambda x: x["energy_pct_of_target"]),
+    by_nutrient = {
+        "energy_kcal": _summary(all_energy,  DAILY_TARGETS["energy"]),
+        "protein_g":   _summary(all_protein, DAILY_TARGETS["protein"]),
+        "carb_g":      _summary(all_carb,    DAILY_TARGETS["carb"]),
+        "sodium_mg":   _summary(all_sodium,  SODIUM_UPPER_LIMIT),
     }
+
+    return {"by_nutrient": by_nutrient, "by_patient": by_patient}

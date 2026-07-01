@@ -99,6 +99,12 @@ def plate_waste_input_agent(state: MealPlanState) -> dict:
             "date":    datetime.now().strftime("%Y-%m-%d"),
             "day":     day,
             "meal":    meal,
+            # [추가 — 2026-07-01] 원본 waste_logs 행의 id를 그대로 실어 보냄.
+            # pipeline_runner.py가 이 값을 nutrition_intake_logs의 고유키로
+            # upsert에 사용함 — day_number만으로는 서로 다른 28일 주기(다른
+            # 달에 실행된 run)의 "1일차"가 같은 값으로 충돌할 수 있어서,
+            # 실제 잔반 기록 원본 행을 키로 삼는 게 안전함.
+            "waste_log_id": entry.get("waste_log_id"),
             "energy":  round(actual["energy"],  1),
             "protein": round(actual["protein"], 1),
             "sodium":  round(actual["sodium"],  1),

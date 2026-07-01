@@ -16,12 +16,20 @@ v2는 graph.py의 build_graph()로 만들어진 app(컴파일된 StateGraph)을
 
 thread_id는 Supabase의 meal_plan_runs.id(run_id)와 동일하게 사용해
 LangGraph 체크포인터의 스레드와 Supabase 실행 기록을 1:1로 묶음.
+
+[수정 — 2026-07-01] _save_waste_alerts가 waste_monitoring_agent.py의
+nutrition_monitor_agent가 실제로 만드는 alert 딕셔너리 키("days",
+"target", "deficit_pct")가 아니라 존재하지 않는 키("consecutive_days",
+"standard_value", "deficit_rate")를 읽고 있어서, nutrition_alerts
+테이블에 해당 컬럼들이 항상 0으로 저장되던 버그를 수정. 또한
+"sent_at": "now()" 문자열 리터럴 버그(meal_plans.py의 approve_run과
+동일 패턴)도 함께 수정.
 """
 
 import sys
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
-import time
 
 AGENTS_DIR = Path(__file__).resolve().parent.parent.parent / "agents"
 if str(AGENTS_DIR) not in sys.path:
@@ -32,6 +40,11 @@ from app.services.patient_logic import build_patient_profile, Sex, KidneyType
 from app.services.preference_persistence_patch import set_active_facility as _set_active_facility
 
 import registry  # agents/registry.py
+
+
+def _now_iso() -> str:
+    """Supabase(Postgres) timestamp 컬럼에 안전하게 넣을 UTC ISO 문자열."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _load_patients_for_facility(facility_id: str, budget_per_meal: float):
@@ -154,6 +167,9 @@ def _load_recent_waste_log(facility_id: str, patients: list) -> list | None:
             "name": name_by_id.get(log["patient_id"], ""),
             "일차": f"{log['day_number']}일",
             "끼니": log["meal_type"],
+            # [추가 — 2026-07-01] nutrition_intake_logs 저장 시 고유키로
+            # 쓰기 위해 원본 waste_logs 행 id를 그대로 실어 보냄.
+            "waste_log_id": log.get("id"),
             "밥":   log.get("rice_waste_rate", 0.0),
             "국":   log.get("soup_waste_rate", 0.0),
             "주찬": log.get("main_dish_waste_rate", 0.0),
@@ -317,19 +333,22 @@ def _resume(run_id: str, action: str, changes: dict | None = None):
 
 
 def _drain_stream(stream_iter):
+    """
+    app.stream()의 모든 이벤트를 소비하고, 마지막으로 관측된 state 조각들을
+    누적해 반환. __interrupt__ 이벤트를 만나면 (True, 누적 state)를 반환.
+    완주하면 (False, 누적 state)를 반환.
+
+    [주의] LangGraph node 함수는 자신이 갱신한 키만 반환하므로(state 전체가
+    아님), 여기서 누적(dict.update)해서 "현재까지의 전체 state 스냅샷"을
+    재구성함. 이는 graph.py __main__ 블록의 출력 로직과 동일한 패턴.
+    """
     accumulated: dict = {}
-    last_time = time.monotonic()
     for event in stream_iter:
-        now = time.monotonic()
         if "__interrupt__" in event:
-            print(f"[pipeline] __interrupt__ (+{now - last_time:.1f}s)")
             return True, accumulated
 
         node = list(event.keys())[0]
         node_output = event[node]
-        print(f"[pipeline] node={node} done (+{now - last_time:.1f}s)")
-        last_time = now
-
         if isinstance(node_output, dict):
             accumulated.update(node_output)
 
@@ -358,12 +377,14 @@ def _finalize_run(run_id: str, state: dict, patients: list, facility_id: str | N
         _save_servings(run_id, state, patients)
     if state.get("waste_log"):
         _save_waste_alerts(run_id, state, patients)
+    if state.get("nutrition_history"):
+        _save_nutrition_intake(state, patients)
 
     update_row = {
         "status":        "approved",
         "reviewed_by":   "auto",
         "review_action": "approve",
-        "reviewed_at":   "now()",
+        "reviewed_at":   _now_iso(),
         "f1_violation":  _safe_float(state.get("violation_rate")),
         "reoptimize_count": state.get("violation_count", 0),
     }
@@ -492,11 +513,69 @@ def _save_servings(run_id: str, state: dict, patients: list):
         ).execute()
 
 
+def _save_nutrition_intake(state: dict, patients: list):
+    """
+    [추가 — 2026-07-01] plate_waste_input_agent(waste_monitoring_agent.py)가
+    계산한 끼니별 실제 섭취 영양(state["nutrition_history"])을
+    nutrition_intake_logs에 저장. "영양소 섭취 현황"(환자별 평균 섭취량)
+    대시보드가 이 테이블을 읽음.
+
+    이전에는 이 계산 결과가 nutrition_history라는 인메모리 state에만
+    존재하고 실행이 끝나면 사라졌음(선호도 점수로 변환되는 용도로만
+    쓰이고, 원본 섭취량 자체는 저장되지 않았음).
+
+    waste_log_id를 고유키로 upsert하므로, 같은 잔반 기록을 다시 계산해도
+    중복 없이 최신 값으로 갱신됨(파이프라인이 매번 nutrition_history를
+    처음부터 재계산하는 구조이기 때문에 중요함).
+    """
+    sb = get_supabase()
+    id_map = _patient_id_lookup(patients)
+    history = state.get("nutrition_history") or {}
+
+    rows = []
+    for name, records in history.items():
+        patient_id = id_map.get(name)
+        if not patient_id:
+            continue
+        for rec in records:
+            waste_log_id = rec.get("waste_log_id")
+            if not waste_log_id:
+                continue  # 원본 잔반 기록과 연결 안 되는 항목은 저장하지 않음
+            day_str = rec.get("day", "0일")
+            try:
+                day_number = int(str(day_str).replace("일", ""))
+            except (TypeError, ValueError):
+                day_number = 0
+
+            rows.append({
+                "waste_log_id": waste_log_id,
+                "patient_id":   patient_id,
+                "day_number":   day_number,
+                "meal_type":    rec.get("meal"),
+                "energy_kcal":  rec.get("energy", 0),
+                "protein_g":    rec.get("protein", 0),
+                "sodium_mg":    rec.get("sodium", 0),
+                "carb_g":       rec.get("carb", 0),
+            })
+
+    if rows:
+        sb.table("nutrition_intake_logs").upsert(
+            rows, on_conflict="waste_log_id"
+        ).execute()
+        print(f"  [nutrition_intake_logs 저장] {len(rows)}건")
+
+
 def _save_waste_alerts(run_id: str, state: dict, patients: list):
     """
     waste_monitoring_subgraph(NutritionMonitorAgent/AlertAgent/InterventionAgent)가
     state['alert_queue']에 쌓아둔 알림+처방을 nutrition_alerts/interventions에 저장.
-    alert_queue 구조는 waste_monitoring_agent.py의 alert_agent 출력을 따름.
+
+    [수정 — 2026-07-01] waste_monitoring_agent.py의 nutrition_monitor_agent가
+    실제로 만드는 alert 딕셔너리 키는 "days"/"target"/"deficit_pct"인데,
+    여기서는 존재하지 않는 키("consecutive_days"/"standard_value"/
+    "deficit_rate")를 읽고 있어 항상 0으로 저장되던 버그를 수정. 아래
+    alert_agent.py의 _format_kakao_message가 쓰는 키와 동일하게 맞춤.
+    "sent_at": "now()" 문자열 리터럴 버그도 함께 수정.
     """
     sb = get_supabase()
     id_map = _patient_id_lookup(patients)
@@ -511,17 +590,17 @@ def _save_waste_alerts(run_id: str, state: dict, patients: list):
         row = {
             "patient_id":       patient_id,
             "nutrient":         alert.get("nutrient"),
-            "consecutive_days": alert.get("consecutive_days", 0),
+            "consecutive_days": alert.get("days", 0),
             "avg_intake":       alert.get("avg_intake", 0),
-            "standard_value":   alert.get("standard_value", 0),
-            "deficit_rate":     alert.get("deficit_rate", 0),
+            "standard_value":   alert.get("target", 0),
+            "deficit_rate":     alert.get("deficit_pct", 0),
             "status":           "sent",
-            "sent_at":          "now()",
+            "sent_at":          _now_iso(),
         }
         result = sb.table("nutrition_alerts").insert(row).execute()
         alert_id = result.data[0]["id"]
 
-        prescription = alert.get("prescription")
+        prescription = alert.get("intervention")
         if prescription:
             sb.table("interventions").insert({
                 "alert_id": alert_id,
