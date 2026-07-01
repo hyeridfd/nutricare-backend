@@ -274,7 +274,7 @@ def optimizer_agent(state: MealPlanState) -> dict:
         for d in range(N_DAYS) for s in range(N_SLOTS)
     ]
     # 항목별 위반 기여도 진단이 필요하면 debug=True로 변경
-    problem._nutrition_violation(best_menus, debug=False)
+    problem._nutrition_violation(best_menus, debug=True)
     # ── 진단 끝 ────────────────────────────────────────────────
 
     # ── Pareto Front 품질 평가 ────────────────────────────────

@@ -17,6 +17,7 @@ Storage 키에 써서 Supabase Storage가 InvalidKey(400)를 반환하던 문제
 """
 
 import os
+from urllib.parse import quote
 from app.services.db_clients import get_supabase
 
 BUCKET = "report-files"
@@ -50,13 +51,22 @@ def upload_report_files(run_id: str, report_paths: dict) -> dict:
                 content = f.read()
 
             content_type = _guess_content_type(safe_filename)
+            # Content-Disposition 헤더는 ASCII만 허용하므로, 한글이 포함된
+            # original_filename을 그대로 넣으면 UnicodeEncodeError가 남
+            # ('ascii' codec can't encode characters...). RFC 5987 방식으로
+            # UTF-8 퍼센트 인코딩한 filename*과, 구형 클라이언트 호환을 위한
+            # ASCII 폴백 filename(safe_filename)을 함께 지정.
+            encoded_filename = quote(original_filename)
+            content_disposition = (
+                f"attachment; filename=\"{safe_filename}\"; "
+                f"filename*=UTF-8''{encoded_filename}"
+            )
             sb.storage.from_(BUCKET).upload(
                 storage_path, content,
                 file_options={
                     "content-type": content_type,
                     "upsert": "true",
-                    # 다운로드 시 사용자에게는 원래 한글 파일명이 보이도록 지정
-                    "content-disposition": f'attachment; filename="{original_filename}"',
+                    "content-disposition": content_disposition,
                 },
             )
             public_url = sb.storage.from_(BUCKET).get_public_url(storage_path)
