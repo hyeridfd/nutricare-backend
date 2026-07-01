@@ -3,6 +3,7 @@ meal_plan_agent.py  ─  MealPlanAgent 노드 (registry 버전)
 """
 
 import os
+import numpy as np
 import pandas as pd
 import registry
 from langchain_neo4j import Neo4jGraph
@@ -12,6 +13,9 @@ from state import MealPlanState
 MEAL_NAMES = ["아침", "점심", "저녁"]
 SLOT_CATS  = [("밥","밥"),("국","국"),("주찬","주찬"),
               ("부찬1","부찬"),("부찬2","부찬"),("김치","김치")]
+
+# orchestrator_agent.py의 VIOLATION_THRESH와 동일하게 유지
+VIOLATION_THRESH = 1.0
 
 
 def _get_recommend_map(graph, diseases: list, menu_names: list) -> dict:
@@ -42,7 +46,26 @@ def meal_plan_agent(state: MealPlanState) -> dict:
     # ── registry에서 pymoo Result 꺼내기 ─────────────────────
     result     = registry.get(state["nsga_result_key"])
     pool       = state["pool"]
-    best_idx   = result.F[:, 0].argmin()
+
+    # [수정 — 2026-07-01] 기존에는 f1(영양 위반)이 가장 낮은 해 하나만
+    # 고정으로 선택해서, f4(부찬 중복/14일 재등장 억제)가 계산되고 있었음에도
+    # 최종 선택에서 완전히 무시되고 있었음. 그 결과 영양은 최적이지만 특정
+    # 메뉴(예: 닭가슴살야채볶음, 방어구이)가 28일 안에서 8번씩 반복되는 등
+    # 다양성이 크게 떨어지는 해가 계속 뽑히는 문제가 있었음.
+    # 이제 f1이 목표치(VIOLATION_THRESH)를 충족하는 해들 중에서는 f4가
+    # 가장 낮은(반복이 적은) 해를 선택함. f1을 충족하는 해가 하나도 없는
+    # 예외 상황에서는 기존처럼 f1이 최소인 해로 안전하게 폴백함.
+    F = result.F
+    passing_mask = F[:, 0] <= VIOLATION_THRESH
+    if passing_mask.any():
+        passing_indices = np.nonzero(passing_mask)[0]
+        best_idx = passing_indices[F[passing_indices, 3].argmin()]
+        print(f"  [선택 기준] f1 통과 해 {len(passing_indices)}개 중 "
+              f"f4(다양성) 최적 해 선택")
+    else:
+        best_idx = F[:, 0].argmin()
+        print(f"  [선택 기준] f1 통과 해 없음 — f1 최소 해로 폴백")
+
     best_chrom = result.X[best_idx]
     best_F     = result.F[best_idx]
 
