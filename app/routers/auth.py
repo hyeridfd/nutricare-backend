@@ -99,3 +99,65 @@ def register_facility(payload: RegisterFacilityRequest):
     }).execute()
 
     return {"id": result.data[0]["id"], "name": result.data[0]["name"]}
+
+
+# [추가 — 2026-07-01] 아이디/비밀번호 변경
+# ==========================================
+# 아직 JWT 검증 미들웨어가 없는 상태(모듈 docstring 참고 — 로그인 게이트
+# 용도로만 토큰을 씀)라, 이 엔드포인트만 토큰으로 신원을 확인할 방법이
+# 없음. 대신 login과 동일한 신뢰 모델을 그대로 적용: "현재 비밀번호를
+# 다시 입력해 본인 확인"하는 방식으로 안전성을 확보함. 나중에 JWT 검증
+# 미들웨어가 추가되면, current_password 확인은 유지한 채 facility_id를
+# 토큰에서 꺼내는 방식으로 바꾸는 게 더 안전함(지금은 프론트가 보내주는
+# facility_id를 그대로 신뢰함).
+class UpdateCredentialsRequest(BaseModel):
+    facility_id: str
+    current_password: str
+    new_login_id: str | None = None
+    new_password: str | None = None
+
+
+class UpdateCredentialsResponse(BaseModel):
+    message: str
+    login_id: str
+
+
+@router.patch("/credentials", response_model=UpdateCredentialsResponse)
+def update_credentials(payload: UpdateCredentialsRequest):
+    sb = get_supabase()
+
+    result = sb.table("facilities").select("id, login_id, password_hash") \
+                .eq("id", payload.facility_id).execute()
+    if not result.data:
+        raise HTTPException(404, "시설 정보를 찾을 수 없습니다.")
+
+    facility = result.data[0]
+    stored_hash = facility.get("password_hash")
+    if not stored_hash or not bcrypt.checkpw(payload.current_password.encode(), stored_hash.encode()):
+        raise HTTPException(401, "현재 비밀번호가 올바르지 않습니다.")
+
+    update_row: dict = {}
+
+    if payload.new_login_id and payload.new_login_id != facility["login_id"]:
+        existing = sb.table("facilities").select("id") \
+                     .eq("login_id", payload.new_login_id).execute()
+        if existing.data:
+            raise HTTPException(400, "이미 사용 중인 아이디입니다.")
+        update_row["login_id"] = payload.new_login_id
+
+    if payload.new_password:
+        if len(payload.new_password) < 8:
+            raise HTTPException(400, "새 비밀번호는 8자 이상이어야 합니다.")
+        update_row["password_hash"] = bcrypt.hashpw(
+            payload.new_password.encode(), bcrypt.gensalt()
+        ).decode()
+
+    if not update_row:
+        raise HTTPException(400, "변경할 아이디 또는 비밀번호를 입력해 주세요.")
+
+    sb.table("facilities").update(update_row).eq("id", payload.facility_id).execute()
+
+    return UpdateCredentialsResponse(
+        message="계정 정보가 수정되었습니다.",
+        login_id=update_row.get("login_id", facility["login_id"]),
+    )
