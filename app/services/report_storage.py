@@ -50,6 +50,17 @@ def upload_report_files(run_id: str, report_paths: dict) -> dict:
             with open(local_path, "rb") as f:
                 content = f.read()
 
+            # [수정 — 2026-07-01] .txt 파일이 브라우저에서 직접 열릴 때
+            # (예: cooking.txt) charset=utf-8 헤더가 CDN을 거치며 유실/무시되면
+            # 브라우저가 인코딩을 잘못 추측해 한글이 깨져 보이는 문제가 있었음
+            # ("멎씰◆웬삥◆씨왏..." 처럼 유효한 다른 한글 음절로 오判독되는
+            # 전형적인 EUC-KR/CP949 오인식 패턴). UTF-8 BOM(0xEF 0xBB 0xBF)을
+            # 파일 맨 앞에 붙이면 Content-Type 헤더와 무관하게 대부분의
+            # 브라우저/에디터가 UTF-8로 확정 인식하므로 이를 방지함.
+            # 원본 바이트 자체는 이미 utf-8이므로 파일 내용은 손상되지 않음.
+            if safe_filename.endswith(".txt") and not content.startswith(b"\xef\xbb\xbf"):
+                content = b"\xef\xbb\xbf" + content
+
             content_type = _guess_content_type(safe_filename)
             # Content-Disposition 헤더는 ASCII만 허용하므로, 한글이 포함된
             # original_filename을 그대로 넣으면 UnicodeEncodeError가 남
