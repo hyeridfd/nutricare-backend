@@ -23,9 +23,21 @@ personalize_agent.py  ─  PersonalizeAgent 노드
      이 두 경우에 한해, 부찬1/부찬2 중 위반 기여도가 큰 슬롯만 교체.
      밥/국/주찬/김치는 절대 교체하지 않음(시설 조리 표준 유지).
 
+     [수정 — 2026-07-01] 기존에는 조건을 만족하는 후보 중 "가장 좋은 값
+     하나"(candidates[0])를 항상 결정론적으로 골라서, 같은 질환유형
+     환자 전원에게 28일 내내 같은 대체 메뉴 하나만 반복되는 문제가 있었음
+     (예: 나트륨 초과 → 전원 항상 '숙주액젓무침'). 이제 후보를 고를 때
+     해당 환자에게 최근 RECENT_LOOKBACK_DAYS일(3주) 안에 이미 대체로
+     사용한 메뉴는 제외하고, 조건을 만족하는 상위 후보들 중에서 무작위로
+     선택함. 최근 이력을 다 제외하고도 후보가 없는 극단적인 경우(메뉴 풀이
+     너무 작을 때)에는 안전(위반 해소)을 우선해 이력을 무시하고서라도
+     최선의 후보를 반환함.
+
   ③ 부찬 슬롯 교체 — 선호도 기반 (①②에서 안 바뀐 부찬 슬롯에 한해)
      개인 선호도 < PERSONAL_DISLIKE AND 시설 전체 기피 Top N 인 메뉴만 대체.
      ②가 이미 바꾼 슬롯은 절대 건드리지 않음(질환 안전이 기호보다 우선).
+     [수정 — 2026-07-01] 이 패스도 같은 3주 최근 이력 회피 + 상위 후보
+     무작위 선택 방식을 적용해 반복을 줄임.
 
 각 교체 건은 reason 태그("disease" | "preference")와 위반/기피 상세 사유를
 함께 기록해 report_agent.py가 정확한 라벨("H형 나트륨 초과 보정" 등)을
@@ -34,6 +46,7 @@ personalize_agent.py  ─  PersonalizeAgent 노드
 대체처럼 보이는 불일치가 있었음 — 이번 변경으로 해소)
 """
 
+import random
 import pandas as pd
 import registry
 from state import MealPlanState
@@ -61,6 +74,21 @@ PERSONAL_DISLIKE  = 0.6   # 개인 선호도 점수 임계값 (이하면 기피)
 FACILITY_DISLIKE  = FACILITY_DISLIKE_THRESHOLD
 MAX_DISLIKE_MENUS = 5
 ALT_MIN_SCORE     = 0.5
+
+# ── 대체 메뉴 다양성 파라미터 ─────────────────────────────────
+# [추가 — 2026-07-01] 같은 환자에게 최근 N일 안에 이미 대체로 쓴 메뉴는
+# 다시 고르지 않도록 함(3주 = 21일).
+RECENT_LOOKBACK_DAYS = 21
+# 조건을 만족하는 후보 중 상위 몇 개 안에서 무작위로 고를지
+ALT_CANDIDATE_POOL = 5
+
+
+def _day_num(day_str) -> int:
+    """'1일' → 1. 파싱 실패 시 0(항상 최근 이력으로 취급되지 않도록 방어)."""
+    try:
+        return int(str(day_str).replace("일", ""))
+    except (TypeError, ValueError):
+        return 0
 
 
 # ════════════════════════════════════════════════════════════
@@ -190,19 +218,47 @@ def _pick_violation_slot(menu_by_slot: dict, field: str, direction: str):
 
 
 def _find_better_alt(pool: dict, cat: str, current_menus: set,
-                      field: str, direction: str, exclude_name: str):
-    """같은 카테고리(부찬) 안에서 더 나은 메뉴 탐색."""
-    candidates = [
+                      field: str, direction: str, exclude_name: str,
+                      recent_names: set | None = None):
+    """
+    같은 카테고리(부찬) 안에서 위반을 해소하는 후보들 중, 최근
+    RECENT_LOOKBACK_DAYS일(3주) 안에 이 환자에게 이미 대체로 쓰인 메뉴는
+    피해서 상위 ALT_CANDIDATE_POOL개 안에서 무작위로 하나 선택.
+
+    [수정 — 2026-07-01] 기존에는 정렬 후 1등(candidates[0])만 항상 반환해
+    같은 질환유형 환자 전원·전체 기간에 걸쳐 대체 메뉴가 한두 개로 고정
+    반복되는 문제가 있었음. 무작위 선택으로 다양성을 확보하되, 정렬 자체는
+    유지해 "위반 해소 효과가 큰 후보 안에서만" 고르도록 함(효과 없는
+    후보가 뽑히는 일은 없음).
+    """
+    recent_names = recent_names or set()
+
+    base_candidates = [
         m for m in pool.get(cat, [])
         if m["menu_name"] not in current_menus and m["menu_name"] != exclude_name
     ]
-    if not candidates:
+    if not base_candidates:
         return None
+
     if direction == "over":
-        candidates.sort(key=lambda m: m.get(field, 0) or 0)
+        base_candidates.sort(key=lambda m: m.get(field, 0) or 0)
     else:
-        candidates.sort(key=lambda m: m.get(field, 0) or 0, reverse=True)
-    return candidates[0]
+        base_candidates.sort(key=lambda m: m.get(field, 0) or 0, reverse=True)
+
+    # 위반 해소 효과가 큰 상위 후보군 안에서만 다양성을 준다
+    top_pool = base_candidates[:ALT_CANDIDATE_POOL]
+    fresh = [m for m in top_pool if m["menu_name"] not in recent_names]
+    if fresh:
+        return random.choice(fresh)
+
+    # 상위 후보가 전부 최근 3주 안에 이미 쓰였다면, 후보 풀을 넓혀서 재시도
+    wider_fresh = [m for m in base_candidates if m["menu_name"] not in recent_names]
+    if wider_fresh:
+        return random.choice(wider_fresh[:ALT_CANDIDATE_POOL])
+
+    # 그래도 없으면(메뉴 풀 자체가 작아 3주 회전이 불가능한 극단적인 경우)
+    # 반복을 감수하더라도 위반 해소(안전)를 우선해 최선의 후보를 반환
+    return base_candidates[0]
 
 
 FIELD_LABELS = {
@@ -227,7 +283,16 @@ def _apply_disease_pass(df: pd.DataFrame, pool: dict, patients: list, pool_index
         c = p.constraint
         disease_label = getattr(p, "disease_type_label", "일반형")
 
+        # [추가 — 2026-07-01] 이 환자에게 카테고리별(부찬)로 최근에 대체
+        # 사용한 메뉴 이력. (day_num, menu_name) 튜플로 누적하고, 매번
+        # RECENT_LOOKBACK_DAYS보다 오래된 항목은 걸러서 사용함.
+        # df.iterrows()가 해당 환자에 대해 항상 일차 순으로 순회된다는
+        # 전제(파이프라인 전체가 1~28일 순으로 df를 구성함)하에 안전함.
+        recent_usage: dict[str, list[tuple[int, str]]] = {}
+
         for _, row in df.iterrows():
+            day_num = _day_num(row.get("일차"))
+
             menu_by_slot = {
                 slot: pool_index.get((SLOT_CATS[slot], row.get(slot, "")), {})
                 for slot in SLOTS
@@ -276,12 +341,28 @@ def _apply_disease_pass(df: pd.DataFrame, pool: dict, patients: list, pool_index
                 current_menus = {m.get("menu_name", "") for m in menu_by_slot.values()}
                 orig_name = menu_by_slot[target_slot].get("menu_name", "")
 
+                # [추가 — 2026-07-01] 최근 3주 안의 사용 이력만 추려서 전달
+                history = recent_usage.get(cat, [])
+                recent_names = {
+                    name for d, name in history
+                    if day_num - d < RECENT_LOOKBACK_DAYS
+                }
+
                 alt = _find_better_alt(pool, cat, current_menus,
-                                        v["field"], v["direction"], orig_name)
+                                        v["field"], v["direction"], orig_name,
+                                        recent_names=recent_names)
                 if alt:
                     override[target_slot] = alt["menu_name"]
                     menu_by_slot[target_slot] = alt
                     changed_slots.add(target_slot)
+
+                    # [추가 — 2026-07-01] 이번 대체를 이력에 기록하고,
+                    # 오래된 이력은 정리(메모리 절약)
+                    updated_history = history + [(day_num, alt["menu_name"])]
+                    recent_usage[cat] = [
+                        (d, n) for d, n in updated_history
+                        if day_num - d < RECENT_LOOKBACK_DAYS
+                    ]
 
                     label = FIELD_LABELS.get(v["field"], v["field"])
                     direction_kr = "초과" if v["direction"] == "over" else "부족"
@@ -330,7 +411,11 @@ def _apply_preference_pass(df: pd.DataFrame, pool: dict, patients: list,
             reverse=True,
         )
 
+        # [추가 — 2026-07-01] 선호도 대체도 같은 3주 최근 이력 회피 적용
+        recent_usage: list[tuple[int, str]] = []
+
         for _, row in df.iterrows():
+            day_num = _day_num(row.get("일차"))
             key = f"{p.name}||{row['일차']}||{row['끼니']}"
             already = already_changed.get(key, {})  # ②에서 이미 바뀐 슬롯(질환 위반)
             override = {}
@@ -351,14 +436,26 @@ def _apply_preference_pass(df: pd.DataFrame, pool: dict, patients: list,
                     row[s] for s in ["밥", "국", "주찬", "부찬1", "부찬2", "김치"]
                     if row.get(s)
                 )
-                alt = next(
-                    (m["menu_name"] for m in alt_candidates
-                     if m["menu_name"] not in current_menus
-                     and pref.get(m["menu_name"], 0.7) >= ALT_MIN_SCORE),
-                    None,
-                )
+
+                recent_names = {
+                    n for d, n in recent_usage if day_num - d < RECENT_LOOKBACK_DAYS
+                }
+                eligible = [
+                    m["menu_name"] for m in alt_candidates
+                    if m["menu_name"] not in current_menus
+                    and pref.get(m["menu_name"], 0.7) >= ALT_MIN_SCORE
+                ]
+                fresh = [m for m in eligible if m not in recent_names]
+                pick_pool = fresh[:ALT_CANDIDATE_POOL] if fresh else eligible[:ALT_CANDIDATE_POOL]
+                alt = random.choice(pick_pool) if pick_pool else None
+
                 if alt:
                     override[slot] = alt
+                    recent_usage.append((day_num, alt))
+                    recent_usage = [
+                        (d, n) for d, n in recent_usage
+                        if day_num - d < RECENT_LOOKBACK_DAYS
+                    ]
                     replace_reasons.setdefault(key, []).append({
                         "slot": slot, "from": menu, "to": alt,
                         "reason": "preference",
