@@ -10,9 +10,17 @@ HITL 흐름:
     진행. 콘솔 input() 대신 review_action='auto'로 기록.
   - approve 엔드포인트는 미리 만들어 둠 — 나중에 auto_approve=False로 바꾸고
     프론트에서 영양사가 직접 승인 버튼을 누르는 흐름으로 전환 가능.
+
+[수정 — 2026-07-01] approve_run/reject_run에서 "reviewed_at": "now()"로
+문자열 그대로 보내던 부분을 수정. Postgres는 'now'는 특수 문자열로
+인식하지만 'now()'(괄호 포함)는 유효한 timestamp로 인식하지 못해
+PostgREST가 400/500을 반환했음(개발자도구 Network 탭에서 approve 요청이
+500 Internal Server Error로 실패하던 원인). datetime.now(timezone.utc)로
+직접 ISO 8601 문자열을 만들어 전달하도록 변경.
 """
 
 import uuid
+from datetime import datetime, timezone
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
@@ -20,6 +28,11 @@ from app.services.db_clients import get_supabase
 from app.services.pipeline_runner import run_pipeline_for_run
 
 router = APIRouter()
+
+
+def _now_iso() -> str:
+    """Supabase(Postgres) timestamp 컬럼에 안전하게 넣을 수 있는 UTC ISO 문자열."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 class RunRequest(BaseModel):
@@ -108,7 +121,7 @@ def approve_run(run_id: str, reviewed_by: str = "영양사", background_tasks: B
         "status": "approving",
         "reviewed_by": reviewed_by,
         "review_action": "approve",
-        "reviewed_at": "now()",
+        "reviewed_at": _now_iso(),
     }).eq("id", run_id).execute()
 
     background_tasks.add_task(resume_after_approval, run_id, "approve")
@@ -135,7 +148,7 @@ def reject_run(run_id: str, reviewed_by: str = "영양사", background_tasks: Ba
         "status": "optimizing",
         "reviewed_by": reviewed_by,
         "review_action": "reoptimize",
-        "reviewed_at": "now()",
+        "reviewed_at": _now_iso(),
     }).eq("id", run_id).execute()
 
     background_tasks.add_task(resume_after_approval, run_id, "reoptimize")
