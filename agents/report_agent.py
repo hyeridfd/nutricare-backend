@@ -18,16 +18,11 @@ TYPE_COLORS = {
     "H형":  "EBF1DE", "일반형": "FFFFFF",
 }
 
-# [변경] disease_type_label에 치매(M) 플래그가 추가되면서 D/H/K/M 조합이
-# 최대 16가지(2^4)로 늘어남. 기존처럼 모든 조합을 TYPE_COLORS에 일일이
-# 하드코딩하면 누락이 생기기 쉬워, 라벨에 포함된 문자를 보고 동적으로
-# 색을 고르는 함수로 대체. M이 포함되면 보라색 계열을 우선 적용해
-# 치매 환자가 시각적으로 바로 구분되게 함.
 def get_type_color(disease_label: str) -> str:
     if disease_label in TYPE_COLORS:
         return TYPE_COLORS[disease_label]
     if "M" in disease_label:
-        return "E1D5E7"  # 치매 포함 조합 - 보라계열
+        return "E1D5E7"
     if "K" in disease_label:
         return "FCE4D6"
     if "D" in disease_label and "H" in disease_label:
@@ -60,21 +55,18 @@ def report_agent(state: MealPlanState) -> dict:
 
     paths: dict = {}
 
-    # 1. 식단표 Excel
     meal_path = _save_meal_plan_excel(df, state.get("recommend_map") or {})
     paths["meal_plan"] = meal_path
 
-    # 2. 개인별 배식량 + 개인화 대체 메뉴 Excel (시트 2개)
     serving_path = _save_serving_excel(
         df, patients,
         state.get("serving_map")    or {},
         state.get("constraint_key"),
         state.get("personal_menus") or {},
-        state.get("personalize_reasons") or {},   # ← 추가: 정확한 교체 사유 라벨용
+        state.get("personalize_reasons") or {},
     )
     paths["serving"] = serving_path
 
-    # 3. GPT-4o 조리 지침서
     openai_key = os.getenv("OPENAI_API_KEY", "")
     if openai_key:
         guide_path = _save_cooking_guide(df, patients, openai_key)
@@ -89,7 +81,6 @@ def report_agent(state: MealPlanState) -> dict:
     }
 
 
-# ── 스타일 헬퍼 ──────────────────────────────────────────────
 def _hdr(ws, addr, val, bg="1F497D", fg="FFFFFF", size=10):
     c = ws[addr]
     c.value = val
@@ -114,9 +105,19 @@ def _border(ws, r1, r2, c1, c2):
             c.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
-# ── 1. 식단표 Excel ──────────────────────────────────────────
 def _save_meal_plan_excel(df: pd.DataFrame, recommend_map: dict,
                           path="식단표_28일.xlsx") -> str:
+    """
+    [수정 — 2026-07-01]
+    - 영양소(열량/나트륨/단백질) 컬럼이 비어 보이는 문제 방어: None/누락 값을
+      0으로 채워서 표시.
+    - 셀 배경색: "권장재료포함수"에 따라 초록색 계열로 강조하던 것을
+      제거하고 흰색으로 통일.
+    - "권장재료포함메뉴"/"권장재료포함수" 컬럼명을 "포함된 식재료"/
+      "식재료 개수"로 변경(표시명만 변경 — 실제 값이 "메뉴 개수"가 아니라
+      "식재료 개수" 의미를 갖게 하려면 이 값을 산출하는 상위 로직
+      (meal_plan_agent.py 등)도 같이 확인이 필요함. 이 파일은 표시만 담당).
+    """
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "28일_식단표"
@@ -124,8 +125,8 @@ def _save_meal_plan_excel(df: pd.DataFrame, recommend_map: dict,
 
     cols   = ["일차","끼니","밥","국","주찬","부찬1","부찬2","김치",
               "열량(kcal)","나트륨(mg)","단백질(g)","비용(원)",
-              "권장재료포함메뉴","권장재료포함수"]
-    widths = [6,6,12,14,14,14,14,10,10,10,9,9,40,8]
+              "포함된 식재료","식재료 개수"]
+    widths = [6,6,12,14,14,14,14,10,10,10,9,9,40,10]
 
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
@@ -138,6 +139,11 @@ def _save_meal_plan_excel(df: pd.DataFrame, recommend_map: dict,
         _hdr(ws, f"{get_column_letter(i)}2", h, bg="2E5A9C", size=9)
     ws.row_dimensions[2].height = 20
 
+    display_source = {
+        "포함된 식재료": "권장재료포함메뉴",
+        "식재료 개수":   "권장재료포함수",
+    }
+
     if "권장재료포함수" not in df.columns:
         df = df.copy()
         df["권장재료포함메뉴"] = "-"
@@ -145,23 +151,17 @@ def _save_meal_plan_excel(df: pd.DataFrame, recommend_map: dict,
 
     for r_idx, row in enumerate(df.itertuples(), 3):
         d = row._asdict()
-        rec_count = d.get("권장재료포함수", 0) or 0
-        try:
-            rec_count = int(rec_count)
-        except (TypeError, ValueError):
-            rec_count = 0
-        bg = "C6EFCE" if rec_count >= 3 else ("E2EFDA" if rec_count >= 1 else "FFFFFF")
 
         for i, col in enumerate(cols, 1):
-            val = d.get(col, "")
-            if col == "권장재료포함수" and rec_count >= 1:
-                _wrt(ws, f"{get_column_letter(i)}{r_idx}", val,
-                     bg="C6EFCE", bold=True, color="375623")
-            elif col == "권장재료포함메뉴" and str(val) != "-":
-                _wrt(ws, f"{get_column_letter(i)}{r_idx}", val,
-                     bg=bg, color="375623", align="left")
-            else:
-                _wrt(ws, f"{get_column_letter(i)}{r_idx}", val, bg=bg)
+            source_col = display_source.get(col, col)
+            val = d.get(source_col, "")
+
+            if col in ("열량(kcal)", "나트륨(mg)", "단백질(g)", "비용(원)", "식재료 개수"):
+                if val is None or val == "":
+                    val = 0
+
+            _wrt(ws, f"{get_column_letter(i)}{r_idx}", val, bg=None,
+                 align="left" if col == "포함된 식재료" else "center")
         ws.row_dimensions[r_idx].height = 16
 
     _border(ws, 2, len(df)+2, 1, len(cols))
@@ -170,7 +170,6 @@ def _save_meal_plan_excel(df: pd.DataFrame, recommend_map: dict,
     return path
 
 
-# ── 2. 개인별 배식량 Excel (개인화 대체 시트 포함) ──────────
 def _save_serving_excel(df: pd.DataFrame, patients: list,
                         serving_map: dict, constraint_key: str,
                         personal_menus: dict,
@@ -181,7 +180,6 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
 
     wb  = openpyxl.Workbook()
 
-    # ── 시트 1: 개인별 배식량 ────────────────────────────────
     ws1 = wb.active
     ws1.title = "개인별_배식량"
     ws1.sheet_view.showGridLines = False
@@ -251,7 +249,6 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
 
     _border(ws1, 2, len(rows_detail)+2, 1, len(col_hdrs))
 
-    # ── 시트 2: 개인화 대체 메뉴 (조리팀용) ─────────────────
     if personal_menus:
         ws2 = wb.create_sheet("개인화_부찬대체")
         ws2.sheet_view.showGridLines = False
@@ -269,8 +266,6 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
             _hdr(ws2, f"{get_column_letter(i)}2", h, bg="4E7C2F", size=9)
         ws2.row_dimensions[2].height = 20
 
-        # personalize_reasons 우선 사용(슬롯별 정확한 사유 보유).
-        # 없는 경우(이전 버전 호환)는 personal_menus만으로 기존 부찬1 라벨 생성.
         df_idx = {
             (row["일차"], row["끼니"], slot): row.get(slot, "")
             for _, row in df.iterrows()
@@ -278,7 +273,7 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
         }
 
         REASON_KR = {"disease": "질환 위반 보정", "preference": "선호도 기반 대체"}
-        REASON_BG = {"disease": "FCE4D6", "preference": "DDEBF7"}  # 주황계 vs 파란계로 구분
+        REASON_BG = {"disease": "FCE4D6", "preference": "DDEBF7"}
 
         p_rows = []
         for key, changes in personal_menus.items():
@@ -295,7 +290,6 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
                     ratio = detail.get("ratio")
                     ratio_str = f"{ratio:.2f}" if ratio else "-"
                 else:
-                    # personalize_reasons에 없는 경우(과거 데이터 호환) — 선호도로 가정
                     orig_menu = df_idx.get((day, meal, slot), "-")
                     reason_code = "preference"
                     full_detail = "기피메뉴 대체"
@@ -304,10 +298,9 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
                 p_rows.append([
                     name, day, meal, REASON_KR.get(reason_code, "기타"),
                     f"{slot}: {orig_menu}", alt_menu, ratio_str, full_detail,
-                    reason_code,  # 정렬/색상용, 출력 안 함(마지막에 pop)
+                    reason_code,
                 ])
 
-        # 이름 → 일차 → 끼니 순 정렬
         meal_order = {"아침": 0, "점심": 1, "저녁": 2}
         p_rows.sort(key=lambda x: (
             x[0],
@@ -316,11 +309,11 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
         ))
 
         for r_idx, row_vals in enumerate(p_rows, 3):
-            reason_code = row_vals.pop()  # 색상 결정용으로만 쓰고 출력에서 제외
+            reason_code = row_vals.pop()
             bg = REASON_BG.get(reason_code, "FFFFFF")
 
             for i, val in enumerate(row_vals, 1):
-                bold = (i == 6)  # 대체 메뉴 컬럼 굵게
+                bold = (i == 6)
                 color = "375623" if i == 6 else "000000"
                 _wrt(ws2, f"{get_column_letter(i)}{r_idx}", val,
                      bg=bg, bold=bold, size=9, color=color,
@@ -347,7 +340,6 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
     return path
 
 
-# ── 3. GPT-4o 조리 지침서 ────────────────────────────────────
 def _save_cooking_guide(df: pd.DataFrame, patients: list,
                         api_key: str, path="조리_지침서.txt") -> str:
     from openai import OpenAI

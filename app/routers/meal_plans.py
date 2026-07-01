@@ -79,6 +79,28 @@ def start_run(payload: RunRequest, background_tasks: BackgroundTasks):
     return RunResponse(run_id=run_id, status="optimizing")
 
 
+@router.get("")
+def list_runs(facility_id: str, limit: int = 20):
+    """
+    [추가 — 2026-07-01] 시설의 최근 실행 이력 목록.
+    영양사가 run_id(UUID)를 직접 입력/기억할 필요 없이, 프론트엔드가 이
+    목록을 드롭다운으로 보여주고 선택만 하면 되도록 하기 위한 엔드포인트.
+    단건 조회(GET /{run_id})와 달리 meal_plan_slots 같은 무거운 데이터는
+    포함하지 않고, 목록에 표시할 요약 필드만 반환함.
+    """
+    sb = get_supabase()
+    result = (
+        sb.table("meal_plan_runs")
+          .select("id,status,diseases_targeted,diseases_excluded,"
+                  "reoptimize_count,f1_violation,created_at,reviewed_at")
+          .eq("facility_id", facility_id)
+          .order("created_at", desc=True)
+          .limit(limit)
+          .execute()
+    )
+    return result.data
+
+
 @router.get("/{run_id}")
 def get_run_status(run_id: str):
     """

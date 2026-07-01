@@ -96,19 +96,25 @@ def meal_plan_agent(state: MealPlanState) -> dict:
         print(f"  [경고] 권장재료 조회 실패: {e}")
         recommend_map = {}
 
-    def rec_summary(row):
-        parts = []
+    # [수정 — 2026-07-01] 기존에는 "권장재료가 하나라도 포함된 메뉴(슬롯)
+    # 개수"를 세고 있었음(최대 6, 밥/국/주찬/부찬1/부찬2/김치 슬롯 단위).
+    # 영양사가 실제로 궁금한 건 "이 끼니에 권장 식재료가 몇 종류 들어갔는가"
+    # (식재료 단위)이므로, 슬롯을 다 순회해 권장재료를 모으고 중복 제거한
+    # 뒤 그 개수를 세도록 변경. 표시 내용도 "메뉴명(재료...)" 형태 대신
+    # 식재료 이름만 나열하도록 바꿈.
+    def rec_ingredients(row) -> list[str]:
+        ingredients: list[str] = []
         for col in ["밥","국","주찬","부찬1","부찬2","김치"]:
-            ing = recommend_map.get(row[col], [])
-            if ing:
-                parts.append(f"{row[col]}({', '.join(ing)})")
-        return " / ".join(parts) if parts else "-"
+            ingredients.extend(recommend_map.get(row[col], []))
+        # 순서를 유지하면서 중복만 제거(dict.fromkeys는 삽입 순서 보존)
+        return list(dict.fromkeys(ingredients))
+
+    def rec_summary(row):
+        ingredients = rec_ingredients(row)
+        return ", ".join(ingredients) if ingredients else "-"
 
     df["권장재료포함메뉴"] = df.apply(rec_summary, axis=1)
-    df["권장재료포함수"]   = df.apply(
-        lambda r: sum(1 for col in ["밥","국","주찬","부찬1","부찬2","김치"]
-                      if recommend_map.get(r[col])), axis=1
-    )
+    df["권장재료포함수"]   = df.apply(lambda r: len(rec_ingredients(r)), axis=1)
 
     print(f"[MealPlanAgent] 완료 — {len(df)}행 식단표 생성")
 
