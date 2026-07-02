@@ -29,17 +29,27 @@ Food-[:HAS_INGREDIENT {nutri_weight}]->Recipe-[:MAPPED_TO]->Product 로
 "1g당 단가"를 "10,933원 ÷ 1"처럼 잘못 계산하던 문제를 수정 — unit
 문자열을 파싱해 실제 g 단위로 환산한 뒤 단가를 계산함.
 
-[주의 — 근사치임을 명확히]
-  - PersonalizeAgent가 환자별로 조정하는 개인화 배식 ratio(부찬 교체,
-    양 조절)는 여기서는 반영하지 않음 — 환자 전원이 "기본 1인분
-    (PORTION_SCALE 적용된)"을 먹는다고 가정한 근사 발주량임. 실제 필요량과
-    다소 차이가 날 수 있으므로, 발주 담당자가 여유분을 고려해 참고용으로
-    사용해야 함.
+[주의 — 여전히 남아있는 근사치]
+  - PersonalizeAgent ①단계(양 조절 ratio, 0.6~1.3배)는 여기서는 반영하지
+    않음 — 부찬 교체(②③단계, personalized_swaps)는 #5에서 반영했지만,
+    "이 환자는 나트륨 때문에 80%만 배식"처럼 같은 메뉴를 양만 줄이는
+    경우까지는 발주량에 정밀 반영하지 않음(전원 기본 1인분 가정).
+    실제 필요량과 다소 차이가 날 수 있으므로, 발주 담당자가 여유분을
+    고려해 참고용으로 사용해야 함.
 [수정 — 2026-07-01 #4] 매 요청마다 Neo4jGraph(...)를 새로 생성해 Aura와
 TLS 핸드셰이크를 반복하던 문제를 수정. 발주 페이지는 주차를 바꿔가며
 반복 조회하는 경우가 많아, 커넥션 재사용의 효과가 특히 큼. 모듈 전역에
 드라이버 하나를 캐싱해 프로세스 내에서 재사용함(Render가 단일 워커
 프로세스로 뜬다는 전제와 동일하게, 이 캐시도 프로세스 단위로 안전함).
+
+[수정 — 2026-07-01 #5] personalized_swaps(개인화 부찬 대체)를 반영.
+이전에는 "메뉴 등장 횟수 × 전체 환자 수"로만 계산해서, 일부 환자가
+질환/선호도 때문에 다른 부찬을 먹는 경우가 발주량에 전혀 반영되지
+않았음(원래 메뉴는 과다 발주, 대체 메뉴는 발주 자체가 누락됨). 이제
+부찬1/부찬2는 (일차, 끼니, 슬롯) 단위로 실제 대체된 인원수만큼 원래
+메뉴에서 빼고 대체 메뉴 쪽에 더함. 각 발주 항목에 is_substitute
+플래그를 추가해, 그 메뉴가 이번 주 안에서 대체찬으로 쓰인 적이
+있는지 바로 알 수 있게 함.
 """
 
 import os
@@ -164,15 +174,58 @@ def _compute_order_data(run_id: str, week_offset: int) -> dict:
             "items": [],
         }
 
-    # 메뉴 등장 횟수 집계(같은 메뉴가 여러 끼니에 반복 등장할 수 있음)
-    menu_occurrences: dict[str, int] = {}
+    # [수정 — 2026-07-01 #5] PersonalizeAgent가 환자별로 바꿔주는 부찬
+    # 대체(personalized_swaps)를 반영. 이전에는 "메뉴 등장 횟수 × 전체
+    # 환자 수"로만 계산해서, 실제로는 일부 환자가 다른 부찬을 먹는데도
+    # 그 사실이 발주량에 전혀 반영되지 않았음(원래 메뉴는 과다 발주,
+    # 대체 메뉴는 발주 누락). 부찬1/부찬2는 (day, meal, slot) 단위로
+    # 실제 대체된 인원수만큼 원래 메뉴에서 빼고 대체 메뉴에 더함.
+    # 밥/국/주찬/김치는 PersonalizeAgent가 손대지 않는 슬롯이라 그대로
+    # "전체 환자 수" 가정을 유지함.
+    swaps = (
+        sb.table("personalized_swaps")
+          .select("day_number,meal_type,slot,original_menu,replaced_menu")
+          .eq("run_id", run_id)
+          .gte("day_number", start_day)
+          .lte("day_number", end_day)
+          .in_("slot", ["부찬1", "부찬2"])
+          .execute()
+          .data
+    )
+    swaps_by_slot: dict[tuple, dict[str, int]] = {}
+    substitute_menu_names: set[str] = set()
+    for sw in swaps:
+        slot_key = (sw["day_number"], sw["meal_type"], sw["slot"])
+        counts = swaps_by_slot.setdefault(slot_key, {})
+        counts[sw["replaced_menu"]] = counts.get(sw["replaced_menu"], 0) + 1
+        substitute_menu_names.add(sw["replaced_menu"])
+
+    FIXED_COLS = ["rice", "soup", "main_dish", "kimchi"]       # 개인화로 안 바뀌는 슬롯
+    SWAPPABLE_COLS = {"side_dish_1": "부찬1", "side_dish_2": "부찬2"}  # 바뀔 수 있는 슬롯
+
+    # 메뉴명 → 이번 주 총 필요 인분 수(이미 환자 수까지 반영된 값)
+    menu_patient_servings: dict[str, int] = {}
+
     for s in slots:
-        for col in ["rice", "soup", "main_dish", "side_dish_1", "side_dish_2", "kimchi"]:
+        for col in FIXED_COLS:
             name = s.get(col)
             if name:
-                menu_occurrences[name] = menu_occurrences.get(name, 0) + 1
+                menu_patient_servings[name] = menu_patient_servings.get(name, 0) + patient_count
 
-    menu_names = list(menu_occurrences.keys())
+        for col, slot_label in SWAPPABLE_COLS.items():
+            base_menu = s.get(col)
+            if not base_menu:
+                continue
+            slot_key = (s["day_number"], s["meal_type"], slot_label)
+            repl_counts = swaps_by_slot.get(slot_key, {})
+            swapped_total = sum(repl_counts.values())
+            remaining = max(patient_count - swapped_total, 0)
+            if remaining:
+                menu_patient_servings[base_menu] = menu_patient_servings.get(base_menu, 0) + remaining
+            for repl_menu, cnt in repl_counts.items():
+                menu_patient_servings[repl_menu] = menu_patient_servings.get(repl_menu, 0) + cnt
+
+    menu_names = list(menu_patient_servings.keys())
     graph = _get_neo4j_graph()
     rows = graph.query(INGREDIENT_QUERY, params={"menu_names": menu_names})
 
@@ -185,11 +238,12 @@ def _compute_order_data(run_id: str, week_offset: int) -> dict:
         if not ingredient:
             continue
 
-        occurrences = menu_occurrences.get(menu_name, 0)
+        total_servings = menu_patient_servings.get(menu_name, 0)
+        if total_servings <= 0:
+            continue
+
         grams_per_serving = row.get("grams_per_serving") or 0.0
-        total_weight_g = round(
-            grams_per_serving * PORTION_SCALE * occurrences * patient_count, 1
-        )
+        total_weight_g = round(grams_per_serving * PORTION_SCALE * total_servings, 1)
 
         price_today = row.get("price_today")
         unit_grams = _parse_unit_to_grams(row.get("unit_str"))
@@ -207,13 +261,17 @@ def _compute_order_data(run_id: str, week_offset: int) -> dict:
         items.append({
             "menu_name": menu_name,
             "ingredient": ingredient,
-            "servings_used": occurrences,
+            "servings_used": total_servings,
             "total_weight_g": total_weight_g,
             "product_name": row.get("product_name"),
             # 구매 단위(예: "1kg" 포장) 하나의 실제 판매가 — 프론트에는
             # 참고용 단가로 표시됨. 정밀 계산은 estimated_cost가 담당.
             "unit_price": round(price_today) if price_today else None,
             "estimated_cost": estimated_cost,
+            # [추가 — 2026-07-01 #5] 이 메뉴가 이번 주 안에서 개인화 대체로
+            # 쓰인 적이 있으면 True. 발주 담당자가 "이건 대체찬이라 원래
+            # 메뉴판엔 없던 항목"임을 바로 알아볼 수 있게 함.
+            "is_substitute": menu_name in substitute_menu_names,
         })
 
     items.sort(key=lambda x: (x["menu_name"], x["ingredient"]))

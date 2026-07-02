@@ -340,10 +340,11 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
         ))
 
         for r_idx, row_vals in enumerate(p_rows, 3):
-            reason_code = row_vals.pop()
+            reason_code = row_vals[-1]  # 색상 결정용. pop() 대신 인덱싱해서
+            # p_rows 자체는 그대로 둠 — 아래 "대체찬_준비명단" 시트에서 재사용.
             bg = REASON_BG.get(reason_code, "FFFFFF")
 
-            for i, val in enumerate(row_vals, 1):
+            for i, val in enumerate(row_vals[:-1], 1):
                 bold = (i == 6)
                 color = "375623" if i == 6 else "000000"
                 _wrt(ws2, f"{get_column_letter(i)}{r_idx}", val,
@@ -363,6 +364,67 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
         )
         print(f"  개인화_부찬대체 시트 저장 완료 ({len(p_rows)}건 — "
               f"질환위반 {n_disease}건 / 선호도 {n_pref}건)")
+
+        # ── 시트 3: 대체찬 준비 명단 (조리팀용, 대체 메뉴 기준 그룹핑) ──
+        # [추가 — 2026-07-01] 시트 2는 환자 기준으로 나열되어 있어, 조리팀이
+        # "이 대체 반찬을 몇 인분 만들어야 하는지, 누구에게 나가는지"를
+        # 바로 보기 어려웠음. 같은 데이터를 대체 메뉴 기준으로 재구성해
+        # 준비 명단 형태로 제공.
+        ws3 = wb.create_sheet("대체찬_준비명단")
+        ws3.sheet_view.showGridLines = False
+
+        by_menu: dict[str, list] = {}
+        for row_vals in p_rows:
+            by_menu.setdefault(row_vals[5], []).append(row_vals)  # index 5 = 대체 메뉴
+        sorted_menus = sorted(by_menu.items(), key=lambda kv: -len(kv[1]))
+
+        col_count = 7
+        for i, w in enumerate([12, 10, 8, 8, 18, 10, 26], 1):
+            ws3.column_dimensions[get_column_letter(i)].width = w
+
+        ws3.merge_cells(f"A1:{get_column_letter(col_count)}1")
+        _hdr(ws3, "A1", "대체찬 준비 명단 (조리팀용 — 대체 메뉴 기준)", bg="375623", size=12)
+        ws3.row_dimensions[1].height = 28
+
+        # 상단 요약표: 대체 메뉴별 총 필요 건수 한눈에 보기
+        ws3["A3"] = "대체 메뉴별 필요 건수 요약"
+        ws3["A3"].font = Font(name="맑은 고딕", bold=True, size=10)
+        sum_hdr_row = 4
+        _hdr(ws3, f"A{sum_hdr_row}", "대체 메뉴", bg="4E7C2F", size=9)
+        _hdr(ws3, f"B{sum_hdr_row}", "필요 건수", bg="4E7C2F", size=9)
+        r = sum_hdr_row + 1
+        for menu_name, rows in sorted_menus:
+            _wrt(ws3, f"A{r}", menu_name, align="left")
+            _wrt(ws3, f"B{r}", len(rows), bold=True)
+            r += 1
+        _border(ws3, sum_hdr_row, r - 1, 1, 2)
+
+        # 상세 명단: 대체 메뉴별로 섹션을 나눠서 나열
+        detail_hdrs = ["이름", "일차", "끼니", "구분", "기존 메뉴", "배식ratio", "사유"]
+        r += 2
+        for menu_name, rows in sorted_menus:
+            ws3.merge_cells(f"A{r}:{get_column_letter(col_count)}{r}")
+            _hdr(ws3, f"A{r}", f"▶ {menu_name}  (총 {len(rows)}건)", bg="6B9B4E", size=10)
+            ws3.row_dimensions[r].height = 20
+            r += 1
+
+            for i, h in enumerate(detail_hdrs, 1):
+                _hdr(ws3, f"{get_column_letter(i)}{r}", h, bg="A9C99A", fg="1F2937", size=9)
+            header_row_idx = r
+            r += 1
+
+            section_start = r
+            for row_vals in rows:
+                name, day, meal, reason_label, orig_str, _alt, ratio_str, detail, reason_code = row_vals
+                values = [name, day, meal, reason_label, orig_str, ratio_str, detail]
+                for i, val in enumerate(values, 1):
+                    align = "left" if i in (5, 7) else "center"
+                    _wrt(ws3, f"{get_column_letter(i)}{r}", val, align=align, size=9)
+                r += 1
+            _border(ws3, header_row_idx, r - 1, 1, col_count)
+            r += 1  # 섹션 간 여백
+
+        print(f"  대체찬_준비명단 시트 저장 완료 ({len(sorted_menus)}종 대체 메뉴)")
     else:
         print("  개인화 대체 없음 — 시트 생략")
 
