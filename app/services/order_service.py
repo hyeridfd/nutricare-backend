@@ -276,6 +276,58 @@ def _compute_order_data(run_id: str, week_offset: int) -> dict:
 
     items.sort(key=lambda x: (x["menu_name"], x["ingredient"]))
 
+    # [수정 — 2026-07-01 #6] 같은 식재료가 여러 메뉴에 쓰이면(예: 마늘이
+    # 15개 메뉴에 들어감) 지금까지는 (메뉴, 식재료) 단위로 행이 쪼개져서
+    # 발주서에 "마늘"이 15줄로 흩어져 나왔음. 실제 발주는 재료 단위로
+    # 한 번에 사야 하므로, 여기서 같은 식재료를 하나의 행으로 합침.
+    # 여러 메뉴에서 쓰였다는 정보는 메뉴명 칸에 요약해서 남겨둠.
+    # [주의] 그래프에 같은 이름의 재료 노드가 여러 개 존재하는 경우(동명
+    # 이인성 노드), 서로 다른 노드라도 이름이 같으면 여기서는 하나로
+    # 합쳐짐 — 단가는 먼저 나온 값을 그대로 유지함.
+    consolidated: dict[str, dict] = {}
+    for it in items:
+        ing = it["ingredient"]
+        entry = consolidated.setdefault(ing, {
+            "menus": [],
+            "servings_used": 0,
+            "total_weight_g": 0.0,
+            "product_name": None,
+            "unit_price": None,
+            "estimated_cost": 0,
+            "is_substitute": False,
+        })
+        entry["menus"].append(it["menu_name"])
+        entry["servings_used"] += it["servings_used"]
+        entry["total_weight_g"] += it["total_weight_g"]
+        entry["estimated_cost"] += it["estimated_cost"] or 0
+        if it["is_substitute"]:
+            entry["is_substitute"] = True
+        if not entry["product_name"] and it["product_name"]:
+            entry["product_name"] = it["product_name"]
+        if entry["unit_price"] is None and it["unit_price"] is not None:
+            entry["unit_price"] = it["unit_price"]
+
+    def _format_menu_list(names: list[str], limit: int = 3) -> str:
+        unique = sorted(set(names))
+        if len(unique) <= limit:
+            return ", ".join(unique)
+        return ", ".join(unique[:limit]) + f" 외 {len(unique) - limit}개"
+
+    consolidated_items = []
+    for ing, e in consolidated.items():
+        consolidated_items.append({
+            "menu_name": _format_menu_list(e["menus"]),
+            "ingredient": ing,
+            "servings_used": e["servings_used"],
+            "total_weight_g": round(e["total_weight_g"], 1),
+            "product_name": e["product_name"],
+            "unit_price": e["unit_price"],
+            "estimated_cost": e["estimated_cost"] or None,
+            "is_substitute": e["is_substitute"],
+        })
+    consolidated_items.sort(key=lambda x: x["ingredient"])
+    items = consolidated_items
+
     return {
         "run_id": run_id,
         "week_range": week_range,

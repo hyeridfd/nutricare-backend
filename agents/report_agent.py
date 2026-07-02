@@ -425,6 +425,87 @@ def _save_serving_excel(df: pd.DataFrame, patients: list,
             r += 1  # 섹션 간 여백
 
         print(f"  대체찬_준비명단 시트 저장 완료 ({len(sorted_menus)}종 대체 메뉴)")
+
+        # ── 시트 4: 환자 유형별 28일 식단표 (대체찬 반영) ──────
+        # [추가 — 2026-07-01] 조리사가 "이 유형 그룹은 이 표대로 조리하면
+        # 됨"을 한눈에 보도록, 완전히 동일한 대체 패턴을 가진 환자들을
+        # 묶어서 각 그룹의 전체 28일 식단표(부찬 대체 반영)를 제공.
+        # 대체가 전혀 없는 환자는 자동으로 "기본형" 그룹이 됨.
+        # [주의] personalize_agent.py의 대체 메뉴 선택에 3주 회전 + 무작위
+        # 다양성 로직이 들어가 있어서, 질환유형이 같아도 환자마다 대체
+        # 메뉴가 조금씩 달라질 수 있음 — 이 경우 "유형"이 기대보다 잘게
+        # 쪼개질 수 있음(예: R001, R068이 완전히 같은 대체를 받지 않을 수
+        # 있음). 그룹 수가 너무 많아 실용성이 떨어지면, 무작위 선택을
+        # "환자 이름"이 아니라 "질환유형(disease_type_label)" 단위로
+        # 고정하는 방식으로 personalize_agent.py를 조정하는 것도 가능함.
+        ws4 = wb.create_sheet("유형별_28일_식단표")
+        ws4.sheet_view.showGridLines = False
+
+        SLOT_COLS = ["밥", "국", "주찬", "부찬1", "부찬2", "김치"]
+        day_meal_cols = ["일차", "끼니"] + SLOT_COLS
+
+        # 환자별 (일차, 끼니, 슬롯) → 대체 메뉴 맵 구성
+        patient_changes: dict[str, dict[tuple, str]] = {p.name: {} for p in patients}
+        for key, changes in personal_menus.items():
+            name, day, meal = key.split("||")
+            for slot, alt_menu in changes.items():
+                patient_changes.setdefault(name, {})[(day, meal, slot)] = alt_menu
+
+        def _signature(changes: dict) -> tuple:
+            return tuple(sorted(changes.items()))
+
+        groups: dict[tuple, list[str]] = {}
+        for p in patients:
+            sig = _signature(patient_changes.get(p.name, {}))
+            groups.setdefault(sig, []).append(p.name)
+
+        # 인원 많은 그룹(보통 "기본형")이 먼저 보이도록 정렬
+        sorted_groups = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+
+        widths = [6, 6, 12, 14, 14, 14, 14, 10]
+        for i, w in enumerate(widths, 1):
+            ws4.column_dimensions[get_column_letter(i)].width = w
+
+        ws4.merge_cells(f"A1:{get_column_letter(len(day_meal_cols))}1")
+        _hdr(ws4, "A1", "환자 유형별 28일 식단표 (개인화 대체 반영)", bg="1F497D", size=12)
+        ws4.row_dimensions[1].height = 28
+
+        r = 3
+        for group_idx, (sig, names) in enumerate(sorted_groups, 1):
+            label = "기본형 (대체 없음)" if not sig else f"유형 {group_idx}"
+            ws4.merge_cells(f"A{r}:{get_column_letter(len(day_meal_cols))}{r}")
+            _hdr(ws4, f"A{r}", f"▶ {label} — 대상: {', '.join(names)} (총 {len(names)}명)",
+                 bg="375623", size=10)
+            ws4.row_dimensions[r].height = 20
+            r += 1
+
+            for i, h in enumerate(day_meal_cols, 1):
+                _hdr(ws4, f"{get_column_letter(i)}{r}", h, bg="4E7C2F", size=9)
+            header_row_idx = r
+            r += 1
+
+            changes_map = dict(sig)  # (일차, 끼니, 슬롯) -> 대체 메뉴
+            section_start = r
+            for _, row in df.iterrows():
+                day, meal = row["일차"], row["끼니"]
+                values = [day, meal]
+                changed_flags = []
+                for slot in SLOT_COLS:
+                    base_val = row.get(slot, "")
+                    alt = changes_map.get((day, meal, slot))
+                    values.append(alt if alt else base_val)
+                    changed_flags.append(alt is not None)
+
+                for i, val in enumerate(values, 1):
+                    # 앞 2칸(일차,끼니) 제외, 슬롯 칸 중 실제로 바뀐 것만 강조
+                    is_changed = i > 2 and changed_flags[i - 3]
+                    bg = "FFF2CC" if is_changed else None
+                    _wrt(ws4, f"{get_column_letter(i)}{r}", val, bg=bg, size=9)
+                r += 1
+            _border(ws4, header_row_idx, r - 1, 1, len(day_meal_cols))
+            r += 2  # 그룹 간 여백
+
+        print(f"  유형별_28일_식단표 시트 저장 완료 ({len(sorted_groups)}개 유형)")
     else:
         print("  개인화 대체 없음 — 시트 생략")
 
