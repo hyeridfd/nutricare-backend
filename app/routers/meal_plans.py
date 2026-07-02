@@ -11,12 +11,18 @@ HITL 흐름:
   - approve 엔드포인트는 미리 만들어 둠 — 나중에 auto_approve=False로 바꾸고
     프론트에서 영양사가 직접 승인 버튼을 누르는 흐름으로 전환 가능.
 
-[수정 — 2026-07-01] approve_run/reject_run에서 "reviewed_at": "now()"로
+[수정 — 2026-07-01 #1] approve_run/reject_run에서 "reviewed_at": "now()"로
 문자열 그대로 보내던 부분을 수정. Postgres는 'now'는 특수 문자열로
 인식하지만 'now()'(괄호 포함)는 유효한 timestamp로 인식하지 못해
 PostgREST가 400/500을 반환했음(개발자도구 Network 탭에서 approve 요청이
 500 Internal Server Error로 실패하던 원인). datetime.now(timezone.utc)로
 직접 ISO 8601 문자열을 만들어 전달하도록 변경.
+
+[추가 — 2026-07-01 #2] GET /{run_id}/types — report_agent.py의
+"유형별_28일_식단표" 엑셀 시트와 동일한 로직을 API로 노출. personalized_swaps
+결과가 완전히 동일한 환자끼리 자동으로 그룹핑해서, 그룹별 28일 식단표를
+반환함. 화면에서 엑셀 다운로드 없이 유형을 선택해 바로 확인할 수 있게
+하기 위함(MentorDesign.tsx의 요청).
 """
 
 import uuid
@@ -197,3 +203,106 @@ def get_servings(run_id: str, patient_id: str | None = None):
         query = query.eq("patient_id", patient_id)
     result = query.order("day_number").execute()
     return result.data
+
+
+# ── 슬롯 컬럼(DB) ↔ 한글 라벨(personalized_swaps.slot과 동일 표기) ──
+_SLOT_COL_TO_LABEL = {
+    "rice": "밥", "soup": "국", "main_dish": "주찬",
+    "side_dish_1": "부찬1", "side_dish_2": "부찬2", "kimchi": "김치",
+}
+
+
+@router.get("/{run_id}/types")
+def get_meal_plan_types(run_id: str):
+    """
+    [추가 — 2026-07-01] report_agent.py의 "유형별_28일_식단표" 엑셀 시트와
+    동일한 로직. personalized_swaps 결과(2단계 칼륨/식이섬유 보강, 3단계
+    치매 영양소 보강)가 완전히 동일한 환자끼리 자동으로 그룹핑해서,
+    그룹별 28일 식단표를 반환함. 대체가 전혀 없는 환자는 자동으로
+    "기본형" 그룹이 됨.
+    """
+    sb = get_supabase()
+
+    run = sb.table("meal_plan_runs").select("facility_id").eq("id", run_id).single().execute()
+    if not run.data:
+        raise HTTPException(404, "실행 기록을 찾을 수 없습니다.")
+    facility_id = run.data["facility_id"]
+
+    slots = (
+        sb.table("meal_plan_slots")
+          .select("day_number,meal_type,rice,soup,main_dish,side_dish_1,side_dish_2,kimchi")
+          .eq("run_id", run_id)
+          .order("day_number")
+          .execute()
+          .data
+    )
+    if not slots:
+        return {"run_id": run_id, "groups": []}
+
+    patients = (
+        sb.table("patients")
+          .select("id,name")
+          .eq("facility_id", facility_id)
+          .eq("active", True)
+          .execute()
+          .data
+    )
+    if not patients:
+        return {"run_id": run_id, "groups": []}
+    id_to_name = {p["id"]: p["name"] for p in patients}
+
+    swaps = (
+        sb.table("personalized_swaps")
+          .select("patient_id,day_number,meal_type,slot,replaced_menu")
+          .eq("run_id", run_id)
+          .execute()
+          .data
+    )
+
+    # patient_id -> {(day_number, meal_type, slot_label): replaced_menu}
+    patient_changes: dict[str, dict[tuple, str]] = {pid: {} for pid in id_to_name}
+    for sw in swaps:
+        pid = sw["patient_id"]
+        if pid not in patient_changes:
+            continue  # 비활성 환자 등은 제외
+        patient_changes[pid][(sw["day_number"], sw["meal_type"], sw["slot"])] = sw["replaced_menu"]
+
+    def _signature(changes: dict) -> tuple:
+        return tuple(sorted(changes.items()))
+
+    groups: dict[tuple, list[str]] = {}
+    for pid, name in id_to_name.items():
+        sig = _signature(patient_changes.get(pid, {}))
+        groups.setdefault(sig, []).append(name)
+
+    # 인원 많은 그룹(보통 "기본형")이 먼저 오도록 정렬
+    sorted_groups = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+
+    result_groups = []
+    for idx, (sig, names) in enumerate(sorted_groups, 1):
+        changes_map = dict(sig)
+        label = "기본형" if not sig else f"유형 {idx}"
+
+        day_rows = []
+        for s in slots:
+            day, meal = s["day_number"], s["meal_type"]
+            row = {"day_number": day, "meal_type": meal}
+            changed_slots = []
+            for col, slot_label in _SLOT_COL_TO_LABEL.items():
+                base_val = s.get(col)
+                alt = changes_map.get((day, meal, slot_label))
+                row[col] = alt if alt else base_val
+                if alt:
+                    changed_slots.append(col)
+            row["changed_slots"] = changed_slots
+            day_rows.append(row)
+
+        result_groups.append({
+            "type_index": idx,
+            "label": label,
+            "patient_names": sorted(names),
+            "patient_count": len(names),
+            "slots": day_rows,
+        })
+
+    return {"run_id": run_id, "groups": result_groups}
