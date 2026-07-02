@@ -489,143 +489,168 @@ HYPERTENSION_FIBER_MIN = 7
 HYPERTENSION_BOOST_FIELDS = ["potassium", "fiber"]
 
 
-def _apply_hypertension_boost_pass(df: pd.DataFrame, pool: dict, patients: list,
-                                    pool_index: dict, already_changed: dict):
+# [수정 — 2026-07-01] 기존에는 2단계/3단계 모두 "환자 한 명씩 순회하며
+# 독립적으로 무작위 대체 메뉴를 뽑는" 구조였음. 그런데 ①단계가 더 이상
+# 대체를 하지 않게 되면서(순수 ratio 전용), 같은 (일차,끼니)에 대한
+# 기본 식단·already_changed 상태가 자격이 같은 환자들 사이에서 완전히
+# 동일해짐. 이 상태에서도 환자마다 독립적으로 random.choice를 호출하니,
+# 파이썬의 전역 random 상태가 호출 순서에 따라 달라져 같은 조건인데도
+# 서로 다른 대체 메뉴가 뽑히는 문제가 있었음(실측: 68명이 거의 전원
+# 서로 다른 "유형"으로 쪼개짐). 이제 (일차, 끼니, already_changed 시그니처)
+# 조합별로 대체 여부·대체 메뉴를 "딱 한 번만" 계산하고, 그 결과를 그
+# 조합에 해당하는 모든 환자에게 동일하게 적용함 — 그룹핑이 오직 질환
+# 보유 여부로만 갈리도록 보장하는 핵심 장치.
+def _apply_group_boost_pass(df: pd.DataFrame, pool: dict, patients: list,
+                             pool_index: dict, already_changed: dict,
+                             eligibility_fn, boost_fields_fn, reason_type: str,
+                             detail_fn, gate_fn=None):
     """
-    반환: (personal_menus, replace_reasons) — 다른 패스와 동일한 형태.
-    ①②(질환 위반 보정)가 이미 채운 슬롯은 건드리지 않음.
+    공통 로직 — 2단계(고혈압)/3단계(치매)가 공유해서 씀.
+
+    eligibility_fn(p)      -> bool   : 이 패스 대상 환자인지
+    boost_fields_fn(p)     -> list   : 이 환자 기준 보강 대상 영양소 필드
+                                        (2/3단계 전부 disease membership만
+                                        으로 정해지므로 그룹 내에서는 항상
+                                        동일한 값이 나옴)
+    gate_fn(total)         -> (bool, list[str]) | None
+                              None이면 무조건 대체(치매), 함수가 있으면
+                              그 결과가 True일 때만 대체(고혈압 임계값 체크)
+    detail_fn(disease_label, need_labels) -> str : 사유 텍스트
     """
     personal_menus: dict = {}
     replace_reasons: dict = {}
 
-    for p in patients:
-        resolved = p._resolve_diseases() if hasattr(p, "_resolve_diseases") else []
-        if not any("고혈압" in d for d in resolved):
-            continue  # 고혈압 없는 환자는 이 패스 대상 아님
+    eligible = [p for p in patients if eligibility_fn(p)]
+    if not eligible:
+        return personal_menus, replace_reasons
 
-        disease_label = getattr(p, "disease_type_label", "일반형")
-        recent_usage: list[tuple[int, str]] = []
+    group_recent_usage: dict[tuple, list[tuple[int, str]]] = {}
 
-        for _, row in df.iterrows():
-            day_num = _day_num(row.get("일차"))
-            key = f"{p.name}||{row['일차']}||{row['끼니']}"
-            already = already_changed.get(key, {})
+    for _, row in df.iterrows():
+        day_num = _day_num(row.get("일차"))
+        day, meal = row["일차"], row["끼니"]
 
+        menu_by_slot = {
+            slot: pool_index.get((SLOT_CATS[slot], row.get(slot, "")), {})
+            for slot in SLOTS
+        }
+        if not all(menu_by_slot.values()):
+            continue
+        total = _sum_meal_nutrition(menu_by_slot)
+
+        if gate_fn:
+            proceed, need_labels = gate_fn(total)
+            if not proceed:
+                continue
+        else:
+            need_labels = None
+
+        # already_changed 시그니처가 같은 환자끼리 서브그룹으로 묶음
+        # (지금 구조상 대부분 하나의 시그니처로 통일되지만, 안전하게
+        # 일반화해 둠 — 예: 고혈압+치매 환자는 2단계가 이미 부찬1을
+        # 채운 상태로 3단계에 들어오므로 다른 시그니처를 가짐)
+        subgroups: dict[tuple, list] = {}
+        for p in eligible:
+            key = f"{p.name}||{day}||{meal}"
+            sig = tuple(sorted(already_changed.get(key, {}).items()))
+            subgroups.setdefault(sig, []).append(p)
+
+        for sig, group_patients in subgroups.items():
+            already = dict(sig)
             available_slots = [s for s in SWAPPABLE_SLOTS if s not in already]
             if not available_slots:
                 continue
-
-            menu_by_slot = {
-                slot: pool_index.get((SLOT_CATS[slot], row.get(slot, "")), {})
-                for slot in SLOTS
-            }
-            if not all(menu_by_slot.values()):
-                continue
-
-            total = _sum_meal_nutrition(menu_by_slot)
-            needs_potassium = total.get("potassium", 0) < HYPERTENSION_POTASSIUM_MIN
-            needs_fiber     = total.get("fiber", 0)     < HYPERTENSION_FIBER_MIN
-            if not (needs_potassium or needs_fiber):
-                continue  # 이미 기준을 충족 — 대체 불필요
-
             target_slot = available_slots[0]
             cat = SLOT_CATS[target_slot]
             current_menus = {m.get("menu_name", "") for m in menu_by_slot.values()}
             orig_name = menu_by_slot[target_slot].get("menu_name", "")
 
+            boost_fields = boost_fields_fn(group_patients[0])
+            if not boost_fields:
+                continue
+
+            cache_key = sig
+            recent_usage = group_recent_usage.setdefault(cache_key, [])
             recent_names = {
                 n for d, n in recent_usage if day_num - d < RECENT_LOOKBACK_DAYS
             }
-            alt = _find_best_boost_alt(pool, cat, current_menus,
-                                        HYPERTENSION_BOOST_FIELDS, orig_name,
-                                        recent_names=recent_names)
-            if not alt:
-                continue
-
-            recent_usage.append((day_num, alt["menu_name"]))
-            recent_usage = [
-                (d, n) for d, n in recent_usage
-                if day_num - d < RECENT_LOOKBACK_DAYS
-            ]
-
-            personal_menus.setdefault(key, {})[target_slot] = alt["menu_name"]
-            need_labels = []
-            if needs_potassium: need_labels.append("칼륨")
-            if needs_fiber:      need_labels.append("식이섬유")
-            replace_reasons.setdefault(key, []).append({
-                "slot": target_slot, "from": orig_name, "to": alt["menu_name"],
-                "reason": "hypertension_boost",
-                "detail": f"{disease_label} {'/'.join(need_labels)} 보강",
-                "ratio": None,
-            })
-
-    return personal_menus, replace_reasons
-
-
-def _apply_boost_pass(df: pd.DataFrame, pool: dict, patients: list,
-                       pool_index: dict, already_changed: dict):
-    """
-    반환: (personal_menus, replace_reasons) — ①②(disease pass)와 동일한
-    형태. already_changed(disease_menus)에 이미 있는 슬롯은 건드리지 않음.
-    """
-    personal_menus: dict = {}
-    replace_reasons: dict = {}
-
-    for p in patients:
-        c = p.constraint
-        boost_nutrients = getattr(c, "boost_nutrients", None) or []
-        if not boost_nutrients:
-            continue  # 이 환자는 boost 대상 질환(치매 등) 없음
-
-        disease_label = getattr(p, "disease_type_label", "일반형")
-        recent_usage: list[tuple[int, str]] = []
-
-        for _, row in df.iterrows():
-            day_num = _day_num(row.get("일차"))
-            key = f"{p.name}||{row['일차']}||{row['끼니']}"
-            already = already_changed.get(key, {})
-
-            # ②단계가 이미 바꾼 슬롯은 제외하고, 남은 부찬 슬롯 하나만 사용
-            available_slots = [s for s in SWAPPABLE_SLOTS if s not in already]
-            if not available_slots:
-                continue
-            target_slot = available_slots[0]
-
-            menu_by_slot = {
-                slot: pool_index.get((SLOT_CATS[slot], row.get(slot, "")), {})
-                for slot in SLOTS
-            }
-            if not all(menu_by_slot.values()):
-                continue
-
-            cat = SLOT_CATS[target_slot]
-            current_menus = {m.get("menu_name", "") for m in menu_by_slot.values()}
-            orig_name = menu_by_slot[target_slot].get("menu_name", "")
-
-            recent_names = {
-                n for d, n in recent_usage if day_num - d < RECENT_LOOKBACK_DAYS
-            }
-            alt = _find_best_boost_alt(pool, cat, current_menus, boost_nutrients,
+            alt = _find_best_boost_alt(pool, cat, current_menus, boost_fields,
                                         orig_name, recent_names=recent_names)
             if not alt:
                 continue
 
             recent_usage.append((day_num, alt["menu_name"]))
-            recent_usage = [
+            group_recent_usage[cache_key] = [
                 (d, n) for d, n in recent_usage
                 if day_num - d < RECENT_LOOKBACK_DAYS
             ]
 
-            personal_menus.setdefault(key, {})[target_slot] = alt["menu_name"]
-            nutrient_label = ", ".join(FIELD_LABELS.get(n, n) for n in boost_nutrients)
-            replace_reasons.setdefault(key, []).append({
-                "slot": target_slot, "from": orig_name, "to": alt["menu_name"],
-                "reason": "boost",
-                "detail": f"{disease_label} 부족 영양소 보강 ({nutrient_label})",
-                "ratio": None,
-            })
+            for p in group_patients:
+                key = f"{p.name}||{day}||{meal}"
+                disease_label = getattr(p, "disease_type_label", "일반형")
+                personal_menus.setdefault(key, {})[target_slot] = alt["menu_name"]
+                replace_reasons.setdefault(key, []).append({
+                    "slot": target_slot, "from": orig_name, "to": alt["menu_name"],
+                    "reason": reason_type,
+                    "detail": detail_fn(disease_label, need_labels),
+                    "ratio": None,
+                })
 
     return personal_menus, replace_reasons
+
+
+def _apply_hypertension_boost_pass(df: pd.DataFrame, pool: dict, patients: list,
+                                    pool_index: dict, already_changed: dict):
+    def _eligible(p):
+        resolved = p._resolve_diseases() if hasattr(p, "_resolve_diseases") else []
+        return any("고혈압" in d for d in resolved)
+
+    def _gate(total):
+        needs_potassium = total.get("potassium", 0) < HYPERTENSION_POTASSIUM_MIN
+        needs_fiber     = total.get("fiber", 0)     < HYPERTENSION_FIBER_MIN
+        need_labels = []
+        if needs_potassium: need_labels.append("칼륨")
+        if needs_fiber:      need_labels.append("식이섬유")
+        return (needs_potassium or needs_fiber), need_labels
+
+    def _detail(disease_label, need_labels):
+        return f"{disease_label} {'/'.join(need_labels)} 보강"
+
+    return _apply_group_boost_pass(
+        df, pool, patients, pool_index, already_changed,
+        eligibility_fn=_eligible,
+        boost_fields_fn=lambda p: HYPERTENSION_BOOST_FIELDS,
+        reason_type="hypertension_boost",
+        detail_fn=_detail,
+        gate_fn=_gate,
+    )
+
+
+def _apply_boost_pass(df: pd.DataFrame, pool: dict, patients: list,
+                       pool_index: dict, already_changed: dict):
+    def _eligible(p):
+        return bool(getattr(p.constraint, "boost_nutrients", None))
+
+    def _boost_fields(p):
+        return getattr(p.constraint, "boost_nutrients", None) or []
+
+    def _detail(disease_label, need_labels):
+        # 치매 등 boost_nutrients는 disease membership만으로 정해지고 eligible
+        # 그룹 내에서 항상 동일하므로, 대표 환자 목록 대신 고정 라벨을 사용.
+        nutrient_label = ", ".join(
+            FIELD_LABELS.get(n, n) for n in
+            ["iron", "vit_a", "thiamin", "vit_c", "vit_d"]
+        )
+        return f"{disease_label} 부족 영양소 보강 ({nutrient_label})"
+
+    return _apply_group_boost_pass(
+        df, pool, patients, pool_index, already_changed,
+        eligibility_fn=_eligible,
+        boost_fields_fn=_boost_fields,
+        reason_type="boost",
+        detail_fn=_detail,
+        gate_fn=None,
+    )
 
 
 # ════════════════════════════════════════════════════════════
