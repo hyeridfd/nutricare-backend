@@ -279,16 +279,24 @@ def _apply_disease_pass(df: pd.DataFrame, pool: dict, patients: list, pool_index
     personal_menus: dict = {}
     replace_reasons: dict = {}
 
+    # [수정 — 2026-07-01] 기존에는 recent_usage를 환자별로 매번 새로
+    # 시작해서, 같은 질환유형(disease_type_label)이라 위반 발생 시점·항목이
+    # 100% 동일한 환자들끼리도 대체 메뉴가 무작위로 서로 달라지는 문제가
+    # 있었음(그 결과 "유형별_28일_식단표"에서 원래 같아야 할 환자들이
+    # 서로 다른 유형으로 쪼개짐). 이제 recent_usage와 "이번 위반에 뭘로
+    # 바꿨는지"를 환자 단위가 아니라 질환유형 단위로 공유해, 같은 유형은
+    # 항상 같은 대체 결과를 받도록 함. 21일 다양성 로직 자체는 그대로
+    # 유지되지만, 이제 "그 유형이 최근 21일 안에 뭘 썼는지" 기준으로 도는
+    # 것으로 의미가 바뀜(환자별 회전 → 유형별 회전).
+    recent_usage_by_type: dict[str, dict[str, list[tuple[int, str]]]] = {}
+    # (질환유형, 일차, 끼니, 슬롯, 위반항목, 방향) → 이번에 선택된 대체 메뉴명.
+    # 같은 유형·같은 위반이면 이 캐시를 그대로 재사용해 무작위 재추첨을 피함.
+    chosen_alt_cache: dict[tuple, str] = {}
+
     for p in patients:
         c = p.constraint
         disease_label = getattr(p, "disease_type_label", "일반형")
-
-        # [추가 — 2026-07-01] 이 환자에게 카테고리별(부찬)로 최근에 대체
-        # 사용한 메뉴 이력. (day_num, menu_name) 튜플로 누적하고, 매번
-        # RECENT_LOOKBACK_DAYS보다 오래된 항목은 걸러서 사용함.
-        # df.iterrows()가 해당 환자에 대해 항상 일차 순으로 순회된다는
-        # 전제(파이프라인 전체가 1~28일 순으로 df를 구성함)하에 안전함.
-        recent_usage: dict[str, list[tuple[int, str]]] = {}
+        recent_usage = recent_usage_by_type.setdefault(disease_label, {})
 
         for _, row in df.iterrows():
             day_num = _day_num(row.get("일차"))
@@ -341,28 +349,39 @@ def _apply_disease_pass(df: pd.DataFrame, pool: dict, patients: list, pool_index
                 current_menus = {m.get("menu_name", "") for m in menu_by_slot.values()}
                 orig_name = menu_by_slot[target_slot].get("menu_name", "")
 
-                # [추가 — 2026-07-01] 최근 3주 안의 사용 이력만 추려서 전달
-                history = recent_usage.get(cat, [])
-                recent_names = {
-                    name for d, name in history
-                    if day_num - d < RECENT_LOOKBACK_DAYS
-                }
+                # [수정 — 2026-07-01] 같은 (질환유형, 일차, 끼니, 슬롯, 위반항목,
+                # 방향) 조합이 이미 다른 환자에서 처리된 적 있으면 그 결과를
+                # 그대로 재사용 — 무작위 재추첨을 피해 같은 유형은 항상 같은
+                # 대체 메뉴를 받게 함.
+                cache_key = (disease_label, row["일차"], row["끼니"],
+                             target_slot, v["field"], v["direction"])
 
-                alt = _find_better_alt(pool, cat, current_menus,
-                                        v["field"], v["direction"], orig_name,
-                                        recent_names=recent_names)
+                if cache_key in chosen_alt_cache:
+                    alt_name = chosen_alt_cache[cache_key]
+                    alt = pool_index.get((cat, alt_name))
+                else:
+                    history = recent_usage.get(cat, [])
+                    recent_names = {
+                        name for d, name in history
+                        if day_num - d < RECENT_LOOKBACK_DAYS
+                    }
+                    alt = _find_better_alt(pool, cat, current_menus,
+                                            v["field"], v["direction"], orig_name,
+                                            recent_names=recent_names)
+                    if alt:
+                        chosen_alt_cache[cache_key] = alt["menu_name"]
+                        # 이 유형이 처음 이 위반을 만났을 때만 이력에 기록
+                        # (재사용 시에는 이미 기록되어 있으므로 중복 기록 방지)
+                        updated_history = history + [(day_num, alt["menu_name"])]
+                        recent_usage[cat] = [
+                            (d, n) for d, n in updated_history
+                            if day_num - d < RECENT_LOOKBACK_DAYS
+                        ]
+
                 if alt:
                     override[target_slot] = alt["menu_name"]
                     menu_by_slot[target_slot] = alt
                     changed_slots.add(target_slot)
-
-                    # [추가 — 2026-07-01] 이번 대체를 이력에 기록하고,
-                    # 오래된 이력은 정리(메모리 절약)
-                    updated_history = history + [(day_num, alt["menu_name"])]
-                    recent_usage[cat] = [
-                        (d, n) for d, n in updated_history
-                        if day_num - d < RECENT_LOOKBACK_DAYS
-                    ]
 
                     label = FIELD_LABELS.get(v["field"], v["field"])
                     direction_kr = "초과" if v["direction"] == "over" else "부족"
