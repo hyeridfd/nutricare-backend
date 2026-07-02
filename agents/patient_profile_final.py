@@ -6,6 +6,46 @@
 """
 patient_profile_final.py
 기존 PatientProfile 기준 유지 + 고령자 최소열량 보정 추가
+
+[수정 — 2026-07-01] 3단계 설계로 재정리 (요청 반영)
+====================================================
+① 1단계(NSGA-II 최적화, 전체 환자 공통): 당뇨병+고혈압 합집합 기준을
+   "고정된 기준 열량"으로 계산해 모든 환자에게 동일하게 적용.
+   - 당류: 기준열량×0.1/4 미만
+   - 단백질: 18g 이상
+   - 지방: 기준열량×0.15/9 ~ 기준열량×0.30/9
+   - 포화지방: 기준열량×0.07/9 이하
+   - 나트륨: 1,350mg 미만 (고혈압 단독 기준 800mg은 메뉴 풀 자체가
+     구조적으로 못 맞춰서, 당뇨병 기준으로 완화. 대신 고혈압 환자는
+     조리 단계에서 저염 처리— facility_optimization.py의
+     ProcessingAgent.build_guide()가 이미 sodium_max가 설정된 환자를
+     "저염 대상"으로 분리해 조리 지침에 반영하고 있으므로 별도 코드
+     추가 없이 그대로 적용됨)
+
+   [원인] 기존에는 이 항목들이 각 환자 개인의 target_energy(BMI로 계산)에
+   비례해서 계산되어, 같은 질환 조합이어도 체중·키가 다르면 기준치가
+   미묘하게(소수점 단위로) 달라졌음. 그 결과 PersonalizeAgent의
+   "유형별 그룹핑"이 예상보다 훨씬 잘게 쪼개지는 문제가 있었음(15개
+   유형 중 8개가 1명짜리로 튀어나옴). 고정 기준열량(ENERGY_MAX=800,
+   끼니 기준 상한과 동일)으로 계산하도록 바꿔서, 같은 질환 조합인
+   환자는 항상 완전히 동일한 기준치를 갖도록 함 — BMI에 따른 실제
+   배식량 조절은 여전히 ServingAgent의 ratio가 담당하므로 개인차가
+   사라지는 게 아니라 "정성적 기준(무엇을 얼마나%)"과 "정량적 배식량
+   (실제 몇 g)"의 역할이 분리됨.
+
+② 2단계(PersonalizeAgent 고정 대체찬, 고혈압 보유 환자만): 칼륨≥700mg,
+   식이섬유≥7g 미달 시 끼니당 부찬 1개를 보강 메뉴로 대체.
+   고혈압 단독이든 당뇨/치매와 병존이든(고혈압+당뇨, 고혈압+치매,
+   고혈압+당뇨+치매) "고혈압이 있는지" 여부로만 판단 — 다른 질환
+   동반 여부나 체중 등 개인 신체 정보와 무관.
+   [수정] potassium_min/fiber_min을 고혈압 DISEASE_CRITERIA에서 제거함
+   (700/7 자체는 원래도 고정값이라 BMI 무관이었지만, ①단계 NSGA-II
+   최적화 대상에서 완전히 빼서 personalize_agent.py의 전용 고정
+   대체찬 로직으로 일원화 — 구현은 personalize_agent.py 참고).
+
+③ 3단계(PersonalizeAgent 고정 대체찬, 치매 보유 환자만): 기존
+   boost_nutrients(철분/비타민A/티아민/비타민C/비타민D) 로직 그대로
+   유지 — 원래부터 disease membership만으로 결정되고 BMI와 무관했음.
 """
 from dataclasses import dataclass, field
 from enum import IntEnum, Enum
@@ -52,12 +92,21 @@ class NutritionConstraint:
 ENERGY_MIN_SENIOR = 500   # ← 핵심 보정값
 ENERGY_MAX        = 800
 
+# [추가 — 2026-07-01] 당뇨병/고혈압의 당류·지방·포화지방 기준을 계산할 때
+# 쓰는 "고정 기준열량". 원래는 각 환자의 target_energy(BMI로 계산되어
+# 사람마다 다름)를 썼는데, 그러면 같은 질환 조합이어도 체중이 다르면
+# 기준치가 미묘하게 달라져 PersonalizeAgent의 유형 그룹핑이 잘게
+# 쪼개지는 문제가 있었음. ENERGY_MAX(끼니 기준 상한, 800kcal)를 그대로
+# 재사용해 모든 환자에게 동일한 기준을 적용함.
+COMMON_CRITERIA_ENERGY_REF = ENERGY_MAX
+
 DISEASE_CRITERIA = {
     "당뇨병": lambda e: NutritionConstraint(
         energy_min=ENERGY_MIN_SENIOR, energy_max=ENERGY_MAX,
-        sugar_max=round(e * 0.1 / 4, 2),       # 단당류·이당류 유래 열량 < 총열량 10%
+        # [수정] e(개인별 target_energy) 대신 고정 기준열량 사용
+        sugar_max=round(COMMON_CRITERIA_ENERGY_REF * 0.1 / 4, 2),
         protein_min=18,                          # 단백질 18g 이상
-        sat_fat_max=round(e * 0.1 / 9, 2),     # 포화지방 유래 열량 < 총열량 10%
+        sat_fat_max=round(COMMON_CRITERIA_ENERGY_REF * 0.1 / 9, 2),
         sodium_max=1350,                         # 나트륨 1,350mg 이하
     ),
     # "신장_투석": lambda e: NutritionConstraint(
@@ -69,7 +118,10 @@ DISEASE_CRITERIA = {
     "신장질환": lambda e: NutritionConstraint(
         energy_min=ENERGY_MIN_SENIOR, energy_max=ENERGY_MAX,
         protein_max=round(e * 0.1 / 4, 2)
-
+        # [참고] 신장질환은 이번 재정리 범위에서 제외 — 체중 비례 단백질
+        # 제한이 임상적으로 의미 있는 개인차이므로 target_energy(e) 그대로 유지.
+        # facility_optimization.py가 이미 신장질환을 시설 공통 최적화에서
+        # 제외하고 PersonalizeAgent가 개인 단위로 처리하도록 분리해 둠.
         #sodium_max=650,
     ),
     "암": lambda e: NutritionConstraint(
@@ -81,11 +133,19 @@ DISEASE_CRITERIA = {
     ),
     "고혈압": lambda e: NutritionConstraint(
         energy_min=ENERGY_MIN_SENIOR, energy_max=ENERGY_MAX,
-        fat_min=round(e * 0.15 / 9, 2), fat_max=round(e * 0.30 / 9, 2),  # 지방 15~30%
-        sat_fat_max=round(e * 0.07 / 9, 2),     # 포화지방 7% 이하
-        sodium_max=800,                           # 나트륨 800mg 미만 (← 1350에서 수정)
-        potassium_min=700,                        # 칼륨 700mg 이상
-        fiber_min=7,                               # 식이섬유 7g 이상
+        # [수정] e(개인별 target_energy) 대신 고정 기준열량 사용
+        fat_min=round(COMMON_CRITERIA_ENERGY_REF * 0.15 / 9, 2),
+        fat_max=round(COMMON_CRITERIA_ENERGY_REF * 0.30 / 9, 2),
+        sat_fat_max=round(COMMON_CRITERIA_ENERGY_REF * 0.07 / 9, 2),
+        # [수정] 800 → 1350 (당뇨병 기준과 통일). 800mg은 메뉴 풀 구조상
+        # NSGA-II로 도달 불가능한 수준이었음(실측 위반비율 평균 1.03).
+        # 저염 처리는 조리 단계(ProcessingAgent의 low_salt 분리 지침)에서
+        # 계속 담당 — sodium_max가 설정된 환자는 여전히 "저염 대상"으로
+        # 분류되므로 이 부분은 코드 변경 없이 그대로 유지됨.
+        sodium_max=1350,
+        # [제거] potassium_min=700, fiber_min=7 — NSGA-II 공통 최적화
+        # 대상에서 빼고, personalize_agent.py의 전용 2단계 고정 대체찬
+        # 로직(고혈압 보유 환자 전원, 끼니당 최대 1개)으로 이전.
     ),
     "비만": lambda e: NutritionConstraint(
         energy_min=ENERGY_MIN_SENIOR, energy_max=700,  # 비만도 고령자는 700 상한
@@ -157,6 +217,11 @@ def calc_target_energy(bmi, waist_cm, sex,
     """
     BMI/허리 기반 score → 타겟열량
     고령자 최소 보장: energy_min = ENERGY_MIN_SENIOR (500kcal)
+
+    [참고 — 2026-07-01] 이 target_energy는 여전히 BMI에 따라 사람마다
+    다름 — ServingAgent가 실제 배식량(ratio)을 정할 때 계속 사용됨.
+    바뀐 건 "무엇을 얼마나 %로 먹어야 하는지"를 정하는 DISEASE_CRITERIA
+    쪽(당뇨/고혈압의 당류·지방·포화지방)만 고정 기준열량을 쓰도록 한 것.
     """
     score = max(0.0, min(1.0, bmi_score(bmi) + waist_score(waist_cm, sex)))
     return round(energy_min + score * (energy_max - energy_min), 0)
@@ -199,6 +264,12 @@ class PatientProfile:
             energy_min=ENERGY_MIN_SENIOR,
             energy_max=e_max,
         )
+        # [참고] merge_constraints에는 여전히 self.target_energy(BMI 기반)를
+        # 넘김 — 신장질환/암처럼 개인차를 유지해야 하는 질환 기준은 그대로
+        # target_energy를 씀. 당뇨/고혈압의 당류·지방·포화지방만
+        # DISEASE_CRITERIA 내부에서 COMMON_CRITERIA_ENERGY_REF(고정값)를
+        # 쓰도록 이미 바뀌어 있어서, 여기서 넘기는 e 값과 무관하게 항상
+        # 동일한 결과가 나옴.
         self.constraint = merge_constraints(resolved, self.target_energy)
 
     def _validate(self):
